@@ -1,0 +1,22 @@
+[Unit]
+Description=tile-proxy (rectify + passthrough)
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/tile-proxy
+Environment=PROXY_TILE_CACHE_MAX_SIZE=3000
+Environment=PROXY_RATE_LIMIT=180
+Environment=GCJRE_CACHE=/var/cache/tile-proxy
+Environment=GCJRE_CACHE_MAX_MB=512
+Environment=GCJRE_CACHE_MAX_AGE_DAYS=3
+Environment=GCJRE_CACHE_CLEANUP_INTERVAL_S=1800
+Environment=PROXY_ALLOW_PRIVATE_HOSTS=false
+ExecStart=/opt/tile-proxy/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 9002 --workers 1
+Restart=on-failure
+RestartSec=3
+MemoryMax=220M
+
+[Install]
+WantedBy=multi-user.target
