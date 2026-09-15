@@ -32,7 +32,10 @@ logger = logging.getLogger(__name__)
 # ==================== 专用海图代理 ====================
 @router.get("/tiles/ships66/{z}/{x}/{y}.png")
 async def ships66_tile(z: int, x: int, y: int, request: Request, _: None = Depends(_rate_limit_check)):
-    upstream_url = get_str("SHIPS66_TILE_URL_TEMPLATE").format(z=z, x=x, y=y)
+    template = get_str("SHIPS66_TILE_URL_TEMPLATE", "")
+    if not template or "{z}" not in template:
+        raise HTTPException(status_code=503, detail="SHIPS66_TILE_URL_TEMPLATE 未配置")
+    upstream_url = template.format(z=z, x=x, y=y)
     headers = {
         "User-Agent": PROXY_DEFAULT_REQUEST_HEADERS["User-Agent"],
         "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",

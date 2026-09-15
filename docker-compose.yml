@@ -1,0 +1,21 @@
+services:
+  tile-proxy:
+    build: .
+    image: tile-proxy:latest
+    container_name: tile-proxy
+    ports:
+      - "127.0.0.1:9002:9002"
+    environment:
+      PROXY_TILE_CACHE_MAX_SIZE: "3000"
+      PROXY_RATE_LIMIT: "180"
+      GCJRE_CACHE: /data/cache
+      GCJRE_CACHE_MAX_MB: "512"
+      GCJRE_CACHE_MAX_AGE_DAYS: "3"
+      PROXY_ALLOW_PRIVATE_HOSTS: "false"
+    volumes:
+      - tile-proxy-cache:/data/cache
+    restart: unless-stopped
+    mem_limit: 256m
+
+volumes:
+  tile-proxy-cache:

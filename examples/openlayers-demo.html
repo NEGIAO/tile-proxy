@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>tile-proxy demo — OpenLayers</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@v9.2.4/ol.css" />
+  <style>
+    html, body, #map { margin: 0; height: 100%; }
+    .bar {
+      position: absolute; z-index: 1; top: 12px; left: 12px; right: 12px;
+      display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+      font: 14px/1.4 system-ui, sans-serif;
+    }
+    .bar input { flex: 1; min-width: 220px; padding: 6px 8px; }
+    .bar button { padding: 6px 12px; }
+    .hint { background: #fffc; padding: 4px 8px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <div class="bar">
+    <input id="base" placeholder="tile-proxy 基址，如 http://127.0.0.1:9002" />
+    <button id="btnCarto">Carto 直通</button>
+    <button id="btnAmap">高德 gcj2wgs</button>
+    <span class="hint">需本地已启动 tile-proxy；仅作联调示例</span>
+  </div>
+  <div id="map"></div>
+  <script src="https://cdn.jsdelivr.net/npm/ol@v9.2.4/dist/ol.js"></script>
+  <script>
+    const $base = document.getElementById("base");
+    $base.value = localStorage.getItem("tile_proxy_base") || "http://127.0.0.1:9002";
+
+    const map = new ol.Map({
+      target: "map",
+      layers: [new ol.layer.Tile({ source: new ol.source.OSM() })],
+      view: new ol.View({ center: ol.proj.fromLonLat([116.397, 39.909]), zoom: 12 }),
+    });
+
+    function setXYZ(url) {
+      localStorage.setItem("tile_proxy_base", $base.value.replace(/\/+$/, ""));
+      const base = $base.value.replace(/\/+$/, "");
+      map.getLayers().getArray().slice(1).forEach((l) => map.removeLayer(l));
+      map.addLayer(new ol.layer.Tile({ source: new ol.source.XYZ({ url: base + url }) }));
+    }
+
+    document.getElementById("btnCarto").onclick = () =>
+      setXYZ("/proxy/a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png");
+
+    document.getElementById("btnAmap").onclick = () =>
+      setXYZ(
+        // 典型：高德电子图 GCJ → WGS（与线上 vpn.negiao.cn 同构，仅换基址）
+        "/proxy/gcj2wgs/http://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}"
+      );
+  </script>
+</body>
+</html>
