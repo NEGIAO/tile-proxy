@@ -78,7 +78,19 @@ pip install -r requirements.txt
 uvicorn app:app --host 127.0.0.1 --port 9002
 ```
 
-**Docker：**
+**Docker（推荐，免本地 build）：**
+
+```bash
+docker run -d --name tile-proxy -p 127.0.0.1:9002:9002 \
+  -e PROXY_TILE_CACHE_MAX_SIZE=3000 -e PROXY_RATE_LIMIT=180 \
+  negiao/tile-proxy:latest
+
+curl http://127.0.0.1:9002/health
+```
+
+镜像：[`negiao/tile-proxy`](https://hub.docker.com/r/negiao/tile-proxy)（标签 `latest` / `1.0.0`）。
+
+或 clone 后自行构建：
 
 ```bash
 docker compose up -d

@@ -55,10 +55,24 @@ uvicorn app:app --host 127.0.0.1 --port 9002
 
 ### A.2 本机 Docker（不装 Python 时）
 
+**推荐：直接用 Docker Hub 镜像**
+
+```bash
+docker run -d --name tile-proxy -p 127.0.0.1:9002:9002 \
+  -e PROXY_TILE_CACHE_MAX_SIZE=3000 -e PROXY_RATE_LIMIT=180 \
+  negiao/tile-proxy:latest
+```
+
+或 compose（默认即 `negiao/tile-proxy:latest`）：
+
 ```bash
 docker compose up -d
-# 或
-docker run --rm -p 127.0.0.1:9002:9002 tile-proxy
+```
+
+从源码构建时：在 `docker-compose.yml` 里改回 `build: .`，或：
+
+```bash
+docker build -t tile-proxy . && docker run --rm -p 127.0.0.1:9002:9002 tile-proxy
 ```
 
 个人使用一般不必改 env；要压内存再抄 `.env.example`。
@@ -135,10 +149,16 @@ curl -s https://tiles.example.com/health   # 若配置了 /health 反代
 
 ## C. Docker
 
-### C.1 单容器
+镜像仓库：[`negiao/tile-proxy`](https://hub.docker.com/r/negiao/tile-proxy)
+
+| 标签 | 说明 |
+|---|---|
+| `negiao/tile-proxy:latest` | 最新稳定 |
+| `negiao/tile-proxy:1.0.0` | 首个开源版本 |
+
+### C.1 单容器（预构建镜像）
 
 ```bash
-docker build -t tile-proxy .
 docker run -d --name tile-proxy \
   -p 127.0.0.1:9002:9002 \
   -e PROXY_TILE_CACHE_MAX_SIZE=3000 \
@@ -146,7 +166,14 @@ docker run -d --name tile-proxy \
   -e GCJRE_CACHE=/data/cache \
   -v tile-proxy-cache:/data/cache \
   --memory=256m \
-  tile-proxy
+  negiao/tile-proxy:latest
+```
+
+从源码构建：
+
+```bash
+docker build -t tile-proxy .
+docker run -d --name tile-proxy -p 127.0.0.1:9002:9002 tile-proxy
 ```
 
 ### C.2 compose
@@ -155,6 +182,8 @@ docker run -d --name tile-proxy \
 docker compose up -d
 curl http://127.0.0.1:9002/health
 ```
+
+`docker-compose.yml` 默认 `image: negiao/tile-proxy:latest`。
 
 生产仍建议前面加 nginx/Caddy 做 TLS 与域名；compose 里端口绑 `127.0.0.1`。
 

@@ -1,7 +1,9 @@
 services:
   tile-proxy:
-    build: .
-    image: tile-proxy:latest
+    # 默认拉取 Docker Hub 预构建镜像；从源码构建请改为：
+    #   build: .
+    #   image: tile-proxy:local
+    image: negiao/tile-proxy:latest
     container_name: tile-proxy
     ports:
       - "127.0.0.1:9002:9002"
