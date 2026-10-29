@@ -5,7 +5,7 @@
 | 角色 | 典型目标 | 起点 |
 |---|---|---|
 | **线上部署** | 站点/APP 统一走 `https://你的域名/proxy/...` | [deployment.md](deployment.md) §B/C → 回来读契约与前端案例 |
-| **个人本机** | clone 后本机纠偏，OL/Cesium 连 `127.0.0.1:9002` | [deployment.md](deployment.md) §A → 「索引语义」+ `examples/openlayers-demo.html` |
+| **个人本机** | clone 后本机纠偏，OL/Cesium 连 `127.0.0.1:9002` | [deployment.md](deployment.md) §A → 「索引语义」+ 启动后打开 `http://127.0.0.1:9002/` |
 
 ## 1. 路由契约
 
@@ -13,7 +13,8 @@
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/health` | `{"ok":true,"service":"tile-proxy"}` |
+| GET | `/` | 内置示例首页（`examples/openlayers-demo.html`） |
+| GET | `/health` | `{"ok":true,"service":"tile-proxy","version":"x.y.z"}` |
 | GET | `{BASE}/proxy/{host}/{path}?query` | 直通；query 会转发给上游 |
 | GET | `{BASE}/proxy/{scheme}://{完整URL}` | 直通完整 URL 形态 |
 | GET | `{BASE}/proxy/gcj2wgs/{完整上游URL}` | GCJ 瓦片 → WGS84 对齐 |

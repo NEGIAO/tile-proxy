@@ -55,3 +55,26 @@ def get_effective_int(
 
 def get_effective_str(env_key: str, db_key: str = "", default: str = "") -> str:
     return get_str(env_key, default)
+
+
+# ==================== 瓦片缓存策略（唯一真源） ====================
+# 上游各源的 cache-control 天差地别（2026-10-29 实测）：
+#   Google 卫星 lyrs=s      → public, max-age=22222222（≈257 天）
+#   Google 路网 lyrs=m/y    → public, max-age=3600
+#   高德 webrd01/webst01    → max-age=3600
+#   纠偏路由（gcj2wgs 等）  → 完全没有
+# 与其原样透传，不如统一改写成显式策略：浏览器可撤、边缘长存。
+TILE_BROWSER_TTL_SECONDS = get_int(
+    "TILE_BROWSER_TTL_SECONDS", 86400, minimum=0, maximum=2592000
+)
+TILE_EDGE_TTL_SECONDS = get_int(
+    "TILE_EDGE_TTL_SECONDS", 604800, minimum=0, maximum=31536000
+)
+
+
+def tile_cache_control() -> str:
+    """瓦片响应统一的 Cache-Control 值（max-age=浏览器，s-maxage=CDN 边缘）。"""
+    return "public, max-age=%d, s-maxage=%d" % (
+        TILE_BROWSER_TTL_SECONDS,
+        TILE_EDGE_TTL_SECONDS,
+    )

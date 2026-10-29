@@ -9,6 +9,8 @@ __pycache__/
 
 # Runtime
 data/
+# 例外：内置首页的示例数据要随仓库分发（否则新克隆/CI 构建缺文件）
+!examples/data/
 *.log
 .env
 .env.local

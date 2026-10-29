@@ -9,6 +9,7 @@ gcj 双向编排与 gcj 特有的重采样核选择。
 
 from __future__ import annotations
 
+import logging
 import math
 from pathlib import Path
 from typing import Optional, Tuple
@@ -29,11 +30,15 @@ from domains.tiles.rectify.common.grid import (
     _fetch_tile_grid,
     _get_tile_cached,
     _merge_tiles,
-    _save_tile_bytes,
     _tile_cache_path,
+    assess_tile_quality,
+    load_output_cache,
+    save_output_cache,
 )
 from domains.tiles.rectify.common.quad import _quad_warp
 from domains.tiles.rectify.common.url_template import TileUrlTemplate
+
+logger = logging.getLogger(__name__)
 
 # 纠偏重采样核：BILINEAR（同网格 1:1 下与 BICUBIC 肉眼无差、更快、
 # 核半径更小 → 柔化更轻）。如需逐像素锐度优先（bit 级保留源像素），可改
@@ -86,7 +91,8 @@ async def _build_rectified_tile(
     cache_dir: Path,
     source_category: str,
     client: Optional[httpx.AsyncClient],
-) -> bytes:
+    force_refresh: bool = False,
+) -> Tuple[bytes, int, int, bool]:
     """由源坐标系下的精确四角构造纠偏瓦片（QUAD 重采样，几何无缝）。
 
     旧实现只取两角点（LT/RB）+ ``int()`` 截断定位 256 窗口拷贝，带来
@@ -97,6 +103,11 @@ async def _build_rectified_tile(
     Args:
         source_corners: ((lt_lon, lt_lat), (rt_lon, rt_lat),
             (lb_lon, lb_lat), (rb_lon, rb_lat)) 源坐标系四角经纬度
+        force_refresh: 跳过源瓦片缓存强制重取（输出被判废时用）
+
+    Returns:
+        (输出瓦片字节, 源网格瓦片字节总数, 源网格像素总数, 源网格是否全不透明)
+        ——后三者供调用方做有效性校验（体积比对 + 「不透明输入不该产出透明输出」）。
     """
     (lt_lon, lt_lat), (rt_lon, rt_lat), (lb_lon, lb_lat), (rb_lon, rb_lat) = source_corners
     px_lt = lonlat_to_global_px(lt_lon, lt_lat, z)
@@ -121,7 +132,10 @@ async def _build_rectified_tile(
         cache_dir,
         source_category,
         client,
+        force_refresh,
     )
+    source_bytes_total = sum(len(t) for t in tiles)
+    source_pixels = len(tiles) * TILE_SIZE * TILE_SIZE
     composite = _merge_tiles(tiles, x_min, x_max, y_min, y_max)
 
     def _to_composite(px: float, py: float) -> Tuple[float, float]:
@@ -133,8 +147,52 @@ async def _build_rectified_tile(
         _to_composite(*px_rb),  # SE
         _to_composite(*px_rt),  # NE
     )
+    # 合成图全不透明 → 输出必须也全不透明（warp 只从合成图内部取样）。
+    # 这个不变量能抓住"某片被空白顶替"却没过 10% 阈值的情况。
+    source_opaque = composite.getchannel("A").getextrema() == (255, 255)
     warped = _quad_warp(composite, quad, _GCJ_RESAMPLE)
-    return image_to_bytes(warped)
+    return image_to_bytes(warped), source_bytes_total, source_pixels, source_opaque
+
+
+async def _build_with_quality(
+    label: str,
+    corners,
+    z: int,
+    template: TileUrlTemplate,
+    cache_dir: Path,
+    category: str,
+    client: Optional[httpx.AsyncClient],
+    x: int,
+    y: int,
+) -> bytes:
+    """构建纠偏瓦片并做有效性校验，不合格则强制重取一次。
+
+    不合格的典型成因是源网格里有瓦片没取到（拼出来大块透明）。这种结果一旦
+    落盘/上行就会变成各层缓存 7 天的白斑，所以宁可在这里多花一次上游请求。
+    重取仍不合格时只记 error，把数据交给调用方——出口 `_tile_response` 会给它
+    打 `no-store` + `X-Tile-Blank: 1`，不落盘、不进缓存。
+    """
+    tile_bytes, src_total, src_px, src_opaque = await _build_rectified_tile(
+        corners, z, template, cache_dir, category, client
+    )
+    ok, why = assess_tile_quality(
+        tile_bytes, source_bytes_total=src_total, source_pixels=src_px,
+        source_opaque=src_opaque,
+    )
+    if ok:
+        return tile_bytes
+
+    logger.warning("%s 输出不合格(%s)，强制重取：z=%d x=%d y=%d", label, why, z, x, y)
+    tile_bytes, src_total, src_px, src_opaque = await _build_rectified_tile(
+        corners, z, template, cache_dir, category, client, force_refresh=True
+    )
+    ok, why = assess_tile_quality(
+        tile_bytes, source_bytes_total=src_total, source_pixels=src_px,
+        source_opaque=src_opaque,
+    )
+    if not ok:
+        logger.error("%s 重取后仍不合格(%s)：z=%d x=%d y=%d", label, why, z, x, y)
+    return tile_bytes
 
 
 async def get_gcj2wgs_tile(
@@ -155,25 +213,26 @@ async def get_gcj2wgs_tile(
     """
     output_path = _tile_cache_path(cache_dir, template, "gcj2wgs2", z, x, y)
 
-    # 缓存命中：直接返回字节
-    if output_path.exists():
-        return output_path.read_bytes()
+    # 缓存命中：直接返回字节（空白产物由 load_output_cache 判定为无效并清理）
+    cached = load_output_cache(output_path)
+    if cached is not None:
+        return cached
 
     # 低缩放级别：偏差可忽略，直接返回源瓦片
     if z <= 9:
         tile_bytes = await _get_tile_cached(
             x, y, z, template, cache_dir, "source-gcj", client=client
         )
-        _save_tile_bytes(output_path, tile_bytes)
+        save_output_cache(output_path, tile_bytes)
         return tile_bytes
 
     # 高缩放级别：执行像素级纠偏（四角逐点转换，勿取极值压扁）
     wgs_bbox = xyz_to_bbox(x, y, z)
     gcj_corners = wgsbbox_to_gcj_corners(wgs_bbox)
-    tile_bytes = await _build_rectified_tile(
-        gcj_corners, z, template, cache_dir, "source-gcj", client
+    tile_bytes = await _build_with_quality(
+        "gcj2wgs", gcj_corners, z, template, cache_dir, "source-gcj", client, x, y
     )
-    _save_tile_bytes(output_path, tile_bytes)
+    save_output_cache(output_path, tile_bytes)
     return tile_bytes
 
 
@@ -195,23 +254,24 @@ async def get_wgs2gcj_tile(
     """
     output_path = _tile_cache_path(cache_dir, template, "wgs2gcj2", z, x, y)
 
-    # 缓存命中：直接返回字节
-    if output_path.exists():
-        return output_path.read_bytes()
+    # 缓存命中：直接返回字节（空白产物由 load_output_cache 判定为无效并清理）
+    cached = load_output_cache(output_path)
+    if cached is not None:
+        return cached
 
     # 低缩放级别：偏差可忽略，直接返回源瓦片
     if z <= 9:
         tile_bytes = await _get_tile_cached(
             x, y, z, template, cache_dir, "source-wgs", client=client
         )
-        _save_tile_bytes(output_path, tile_bytes)
+        save_output_cache(output_path, tile_bytes)
         return tile_bytes
 
     # 高缩放级别：执行像素级纠偏（四角逐点转换，勿取极值压扁）
     gcj_bbox = xyz_to_bbox(x, y, z)
     wgs_corners = gcjbbox_to_wgs_corners(gcj_bbox)
-    tile_bytes = await _build_rectified_tile(
-        wgs_corners, z, template, cache_dir, "source-wgs", client
+    tile_bytes = await _build_with_quality(
+        "wgs2gcj", wgs_corners, z, template, cache_dir, "source-wgs", client, x, y
     )
-    _save_tile_bytes(output_path, tile_bytes)
+    save_output_cache(output_path, tile_bytes)
     return tile_bytes

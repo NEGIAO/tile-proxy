@@ -70,17 +70,19 @@ flowchart TD
 
 | 路径 | 职责 |
 |---|---|
-| `app.py` | FastAPI、CORS `*`、挂载 `tiles_router`、启停磁盘清理 |
-| `config.py` | 仅 env 的 get_str/int/bool |
+| `app.py` | FastAPI、CORS（默认 `*`）、挂载 `tiles_router`、启停磁盘清理 |
+| `config.py` | 仅 env 的 get_str/int/bool + 瓦片 Cache-Control 策略 |
+| `cache_policy.py` | 纯 ASGI 中间件：统一改写 200 图片响应的 Cache-Control |
+| `origin_guard.py` | 可选来源白名单（默认不挂载，`TILE_PROXY_ENFORCE_ORIGIN=1` 才启用） |
 | `domains/tiles/_router.py` | **先**纠偏路由，**后**通配直通（顺序=正确性） |
-| `routes_rectify.py` | 4 条纠偏端点 + 错误码 400/504/502 |
-| `routes_passthrough.py` | `/proxy/{url}` 流式 + 可选 ships66 |
+| `routes_rectify.py` | 4 条纠偏端点 + 错误码 400/504/502 + 出口质量标记 |
+| `routes_passthrough.py` | `/proxy/{url}` 流式直通（1.1.0 起移除 ships66 端点） |
 | `proxy_shared.py` | 内存缓存、限流、SSRF、出站 httpx |
 | `cache_cleanup.py` | 按龄 + 按容量清磁盘缓存 |
 | `infra/net_guard.py` | 私网/DNS 复判/白名单 |
 | `infra/http_headers.py` | 浏览器 UA、sec-ch-ua、Referer 白名单 |
 | `rectify/common/transform.py` | WGS/GCJ/BD 点坐标互转（含牛顿迭代逆解） |
-| `rectify/common/grid.py` | 信号量并发、字节/像素/网格数护栏、文件缓存、拼接 |
+| `rectify/common/grid.py` | 信号量并发、字节/像素/网格数护栏、文件缓存、拼接、输出有效性校验 |
 | `rectify/common/quad.py` | 四角 QUAD 透视（几何无缝原语；见[接缝与 QUAD 笔记](https://www.negiao.cn/Pages/Note/note-viewer/note-viewer.html?note=tile-rectify-seam-quad-resampling)） |
 | `rectify/gcj/rectify.py` | GCJ 编排 |
 | `rectify/bd/*` | BD09MC 投影 + 跨网格编排 |
@@ -106,7 +108,50 @@ flowchart TD
 | `PROXY_RATE_LIMIT` | 0 | 每 IP 限流（公网必开） |
 | `PROXY_ALLOW_PRIVATE_HOSTS` | false | SSRF |
 
-单片失败补透明空白，不断整流。
+**单片失败不补空白**：重试 `GCJRE_FETCH_ATTEMPTS`（默认 3）次后仍失败即抛错，整块请求以 5xx 结束
+（5xx 不被 nginx / CDN 缓存）。输出侧另有一道有效性校验，把"缺片导致的大块透明"挡在落盘之前。
+
+### 6.1 缓存分层与有效性
+
+**三层缓存，各管一段**：
+
+| 层 | 默认 TTL | 说明 |
+|---|---|---|
+| 进程内 `_tile_cache` | 300s（`PROXY_TILE_CACHE_TTL_SECONDS`） | 纠偏**输出**的内存缓存，纯内存无持久化 |
+| 磁盘 `GCJRE_CACHE` | 7 天（`GCJRE_CACHE_MAX_AGE_DAYS`） | 分 `source-*`（源瓦片）与 `gcj2wgs2`/`wgs2gcj2`/`bd2wgs2`/`wgs2bd2`（输出）两类目录 |
+| 上游 CDN（如 Cloudflare） | 由 `Cache-Control` 决定 | 见下 |
+
+**响应头由 `cache_policy` 中间件统一写入**（纯 ASGI，只改 `http.response.start`，不碰 body）：
+
+```
+Cache-Control: public, max-age=<TILE_BROWSER_TTL_SECONDS>, s-maxage=<TILE_EDGE_TTL_SECONDS>
+```
+
+覆盖范围是 **200 + `image/*`**，并剥掉上游带来的 `expires`/`pragma`。动机：上游各源的
+`cache-control` 差异极大（Google 卫星 257 天、高德与 Google 路网 1 小时、纠偏路由干脆没有），
+原样透传会让浏览器缓存时长失控——一旦某块瓦片被缓存成坏图，CDN purge 清得掉边缘、清不掉浏览器。
+
+> ⚠️ `origin_guard` **不改写** `Cache-Control`。它曾统一打 `private, max-age=300` 以阻止
+> CDN 缓存、保住防盗链白名单，但 `private` 会让共享缓存全部 BYPASS，与边缘缓存直接互斥。
+> 现在分工明确：origin_guard 管「谁能访问」，cache_policy 管「能存多久」。
+> 代价是边缘缓存后缓存键只有 URL，白名单在 CDN 层失效。
+
+**有效性校验**：`grid.assess_tile_quality(data, source_bytes_total, source_pixels)` 三条判据，
+任一条不过即判废，由四个纠偏入口（`gcj2wgs`/`wgs2gcj`/`bd2wgs`/`wgs2bd`）**强制重取一次**
+（`force_refresh=True` 绕过源瓦片缓存），仍不合格则不落盘、响应打 `no-store` + `X-Tile-Blank: 1`：
+
+1. **透明像素占比** > `GCJRE_MAX_TRANSPARENT_PERCENT`（默认 10%）—— 透明 = 源网格缺片，主判据；
+   另有**不变量**：源网格全不透明时，输出出现 >0.5% 透明即判废（warp 只从合成图内部取样，
+   全不透明的输入产不出透明像素；出现透明说明有源片被空白顶替）。源本身含透明时不套用，
+   避免真覆盖边界被无限重试；
+2. **输出 B/px** < 源同指标的 0.2 倍 —— 纠偏是裁剪不是缩放，输出应与源同量级。
+   两侧都按「字节/像素」归一：输出用自身像素数，源用源网格真实像素数（`片数 × 256²`，
+   由调用方传入）。若图省事拿源字节直接除以输出像素，2×2 网格会把源的 B/px 放大 4 倍，
+   海面/沙漠这类正常但极好压的瓦片会被误判成「丢细节」，陷入每请求强制重取 + 永不缓存；
+3. 解码失败。
+
+> **不透明白色一律放行**。那是上游真实的覆盖边界（卫星影像范围外），误判会让空白区域
+> 陷入无限重试、反复回源。只认「透明」这个确定性信号。
 
 ## 7. 已知约束
 

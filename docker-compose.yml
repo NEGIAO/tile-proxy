@@ -3,21 +3,33 @@ services:
     # 默认拉取 Docker Hub 预构建镜像；从源码构建请改为：
     #   build: .
     #   image: tile-proxy:local
+    # 然后：docker compose up -d --build
     image: negiao/tile-proxy:latest
     container_name: tile-proxy
     ports:
       - "127.0.0.1:9002:9002"
     environment:
       PROXY_TILE_CACHE_MAX_SIZE: "3000"
-      PROXY_RATE_LIMIT: "180"
+      # 默认不限流（0）：端口映射后所有请求都来自网桥网关 IP，共用一个计数桶，
+      # 一屏瓦片 20~30 个请求，设了很容易 429。公网部署再改回 "180"。
+      PROXY_RATE_LIMIT: "0"
       GCJRE_CACHE: /data/cache
       GCJRE_CACHE_MAX_MB: "512"
       GCJRE_CACHE_MAX_AGE_DAYS: "3"
       PROXY_ALLOW_PRIVATE_HOSTS: "false"
+      # 1.1.0 新增（默认值即下方取值，按需放开）
+      # GCJRE_FETCH_ATTEMPTS: "3"
+      # GCJRE_BLANK_RETRY_SECONDS: "600"
+      # GCJRE_MAX_TRANSPARENT_PERCENT: "10"
+      # TILE_BROWSER_TTL_SECONDS: "86400"
+      # TILE_EDGE_TTL_SECONDS: "604800"
+      # TILE_PROXY_ENFORCE_ORIGIN: "0"
+      # TILE_PROXY_ALLOWED_ORIGINS: "https://webgis.negiao.cn,http://localhost:5173"
     volumes:
       - tile-proxy-cache:/data/cache
     restart: unless-stopped
     mem_limit: 256m
+    # 镜像自带 HEALTHCHECK（/health），无需在此重复声明
 
 volumes:
   tile-proxy-cache:

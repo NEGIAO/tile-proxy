@@ -7,7 +7,8 @@ Type=simple
 User=www-data
 WorkingDirectory=/opt/tile-proxy
 Environment=PROXY_TILE_CACHE_MAX_SIZE=3000
-Environment=PROXY_RATE_LIMIT=180
+# 默认不限流；公网部署请改成一个具体值（建议 180~300）
+Environment=PROXY_RATE_LIMIT=0
 Environment=GCJRE_CACHE=/var/cache/tile-proxy
 Environment=GCJRE_CACHE_MAX_MB=512
 Environment=GCJRE_CACHE_MAX_AGE_DAYS=3

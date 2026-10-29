@@ -2,54 +2,325 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
-  <title>tile-proxy demo — OpenLayers</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>tile-proxy · 地图瓦片代理 / 纠偏</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%232563eb'/%3E%3Cpath d='M3 6l5-2 5 2v5l-5 2-5-2z' fill='none' stroke='%23fff' stroke-width='1.3'/%3E%3C/svg%3E" />
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@v9.2.4/ol.css" />
   <style>
     html, body, #map { margin: 0; height: 100%; }
-    .bar {
-      position: absolute; z-index: 1; top: 12px; left: 12px; right: 12px;
-      display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
-      font: 14px/1.4 system-ui, sans-serif;
+    body { font: 14px/1.45 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
+    .panel {
+      position: absolute; z-index: 2; top: 12px; left: 12px; right: 12px;
+      display: flex; flex-direction: column; gap: 8px;
+      max-width: 1040px; padding: 10px 12px; border-radius: 10px;
+      background: rgba(255, 255, 255, .93); backdrop-filter: blur(6px);
+      box-shadow: 0 2px 12px rgba(15, 23, 42, .16);
     }
-    .bar input { flex: 1; min-width: 220px; padding: 6px 8px; }
-    .bar button { padding: 6px 12px; }
-    .hint { background: #fffc; padding: 4px 8px; border-radius: 6px; }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .brand { font-size: 15px; font-weight: 650; letter-spacing: .2px; }
+    .brand small { font-weight: 400; color: #64748b; margin-left: 6px; }
+    .spacer { flex: 1; }
+    .grp { color: #94a3b8; font-size: 12px; margin-right: -2px; }
+    button { padding: 6px 12px; border: 1px solid #cbd5e1; border-radius: 6px; background: #fff; cursor: pointer; white-space: nowrap; }
+    button:hover { border-color: #2563eb; color: #2563eb; }
+    button.on { background: #2563eb; border-color: #2563eb; color: #fff; }
+    button.on:hover { color: #fff; }
+    button.raw.on { background: #f97316; border-color: #f97316; }
+    a { color: #2563eb; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    #url {
+      flex: 1; min-width: 260px; padding: 6px 8px; border: 1px solid #cbd5e1; border-radius: 6px;
+      font: 12px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace; color: #0f172a;
+      background: #f8fafc;
+    }
+    #url:focus { outline: 2px solid #bfdbfe; border-color: #2563eb; background: #fff; }
+    .chip { padding: 2px 8px; border-radius: 999px; background: #e2e8f0; color: #334155; font-size: 12px; }
+    .chip.ok { background: #dcfce7; color: #166534; }
+    .chip.bad { background: #fee2e2; color: #991b1b; }
+    .hint { color: #475569; font-size: 12.5px; }
+    .hint code { background: #f1f5f9; padding: 1px 5px; border-radius: 4px; }
+    label.toggle { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; color: #334155; font-size: 13px; }
+    @media (max-width: 620px) { .brand small { display: none; } }
   </style>
 </head>
 <body>
-  <div class="bar">
-    <input id="base" placeholder="tile-proxy 基址，如 http://127.0.0.1:9002" />
-    <button id="btnCarto">Carto 直通</button>
-    <button id="btnAmap">高德 gcj2wgs</button>
-    <span class="hint">需本地已启动 tile-proxy；仅作联调示例</span>
+  <div class="panel">
+    <div class="row">
+      <span class="brand">tile-proxy<small>地图瓦片直通 / GCJ·BD 纠偏</small></span>
+      <span id="status" class="chip">检查中…</span>
+      <span class="spacer"></span>
+      <a href="/docs" target="_blank" rel="noreferrer">API 文档</a>
+      <a href="/health" target="_blank" rel="noreferrer">探活</a>
+    </div>
+
+    <div class="row">
+      <span class="grp">底图</span>
+      <button id="btnOsm" class="on">OSM 原生</button>
+      <button id="btnGoogle">Google 影像</button>
+      <span class="grp">高德</span>
+      <button id="btnAmapRaw" class="raw">原始</button>
+      <button id="btnAmap">gcj2wgs</button>
+      <span class="grp">百度</span>
+      <button id="btnBaiduRaw" class="raw">原始</button>
+      <button id="btnBaidu">bd2wgs</button>
+    </div>
+
+    <div class="row">
+      <input id="url" spellcheck="false" autocomplete="off"
+             placeholder="点上面的示例，这里出现可直接复制的 XYZ 模板" />
+      <button id="btnCopy">复制</button>
+      <button id="btnLoad">加载</button>
+    </div>
+
+    <div class="row hint">
+      <span id="layer"></span>
+    </div>
+    <div class="row hint">
+      <label class="toggle"><input type="checkbox" id="chkBuild" checked /> 建筑白模（WGS84）</label>
+      <span id="buildInfo">加载中…</span>
+      <span class="spacer"></span>
+      <span>切到「原始」看偏移，切到「gcj2wgs / bd2wgs」看对齐；<code>{z}/{x}/{y}</code> 由引擎自动替换。</span>
+    </div>
   </div>
+
   <div id="map"></div>
   <script src="https://cdn.jsdelivr.net/npm/ol@v9.2.4/dist/ol.js"></script>
   <script>
-    const $base = document.getElementById("base");
-    $base.value = localStorage.getItem("tile_proxy_base") || "http://127.0.0.1:9002";
+    // 作为服务内置首页时，基址取当前站点（换端口/反代/域名都不用改）；
+    // 用 file:// 直接打开时退回本机默认端口。
+    const isHttp = location.protocol === "http:" || location.protocol === "https:";
+    const BASE = (isHttp && location.origin) || "http://127.0.0.1:9002";
 
-    const map = new ol.Map({
-      target: "map",
-      layers: [new ol.layer.Tile({ source: new ol.source.OSM() })],
-      view: new ol.View({ center: ol.proj.fromLonLat([116.397, 39.909]), zoom: 12 }),
-    });
+    // 故宫（建筑白模所在区域）——数据加载后会用其真实 extent 重新 fit
+    const HOME = [116.3905, 39.9147];
 
-    function setXYZ(url) {
-      localStorage.setItem("tile_proxy_base", $base.value.replace(/\/+$/, ""));
-      const base = $base.value.replace(/\/+$/, "");
-      map.getLayers().getArray().slice(1).forEach((l) => map.removeLayer(l));
-      map.addLayer(new ol.layer.Tile({ source: new ol.source.XYZ({ url: base + url }) }));
+    const AMAP_TILE = "https://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}";
+    const BAIDU_TILE = "https://maponline0.bdimg.com/tile/?qt=vtile&x={x}&y={y}&z={z}&styles=pl&scaler=1&udt=20240101";
+
+    // 六个示例：url 就是「点一下即可复制」的完整 XYZ 模板
+    const MODES = {
+      osm: {
+        label: "当前图层：OSM 原生（直连，未经代理，用作对照）",
+        url: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        attr: "© OpenStreetMap contributors",
+      },
+      google: {
+        label: "当前图层：Google 影像直通（服务端需能访问 Google）",
+        url: BASE + "/proxy/mt0.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
+        attr: "Imagery © Google",
+      },
+      amapRaw: {
+        label: "当前图层：高德电子图「原始」——直连上游、不经代理，GCJ-02 瓦片贴 WGS84 网格，白模可见整体偏移",
+        url: AMAP_TILE,
+        attr: "© 高德地图（原始 GCJ-02）",
+      },
+      amap: {
+        label: "当前图层：高德电子图 gcj2wgs 纠偏后——路网与白模应严丝合缝",
+        url: BASE + "/proxy/gcj2wgs/" + AMAP_TILE,
+        attr: "© 高德地图 · gcj2wgs 纠偏",
+      },
+      baiduRaw: {
+        label: "当前图层：百度地图「原始」——直连上游、不经代理；百度非标准网格（原点居中、Y 轴向上、res=2^(18-z)），页面已按百度 tileGrid 适配加载，白模偏移最大",
+        url: BAIDU_TILE,
+        attr: "© 百度地图（原始 BD-09）",
+      },
+      baidu: {
+        label: "当前图层：百度地图 bd2wgs 纠偏后——跨网格重采样，索引仍是标准 XYZ",
+        url: BASE + "/proxy/bd2wgs/" + BAIDU_TILE,
+        attr: "© 百度地图 · bd2wgs 纠偏",
+      },
+    };
+
+    const $url = document.getElementById("url");
+    const $status = document.getElementById("status");
+    const $layer = document.getElementById("layer");
+    const $copy = document.getElementById("btnCopy");
+    const $buildInfo = document.getElementById("buildInfo");
+    const $chkBuild = document.getElementById("chkBuild");
+    const buttons = {
+      osm: document.getElementById("btnOsm"),
+      google: document.getElementById("btnGoogle"),
+      amapRaw: document.getElementById("btnAmapRaw"),
+      amap: document.getElementById("btnAmap"),
+      baiduRaw: document.getElementById("btnBaiduRaw"),
+      baidu: document.getElementById("btnBaidu"),
+    };
+
+    // ---- 探活：顺带显示服务端版本 ----
+    async function ping() {
+      try {
+        const ctl = new AbortController();
+        const timer = setTimeout(() => ctl.abort(), 4000);
+        const res = await fetch(BASE + "/health", { signal: ctl.signal, cache: "no-store" });
+        clearTimeout(timer);
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        $status.className = "chip ok";
+        $status.textContent = "在线 · v" + (data.version || "?");
+      } catch (err) {
+        $status.className = "chip bad";
+        $status.textContent = "未连通";
+      }
+    }
+    ping();
+
+    if (typeof ol === "undefined") {
+      $layer.textContent = "OpenLayers 加载失败：需能访问 cdn.jsdelivr.net（离线请本地化 ol.js）";
+      throw new Error("OpenLayers not loaded");
     }
 
-    document.getElementById("btnCarto").onclick = () =>
-      setXYZ("/proxy/a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png");
+    // 只有一个瓦片图层：换示例/改 URL 时直接 setSource()，不叠层、不残留
+    const tileLayer = new ol.layer.Tile({ source: new ol.source.OSM() });
+    const map = new ol.Map({
+      target: "map",
+      layers: [tileLayer],
+      view: new ol.View({ center: ol.proj.fromLonLat(HOME), zoom: 15 }),
+    });
 
-    document.getElementById("btnAmap").onclick = () =>
-      setXYZ(
-        // 典型：高德电子图 GCJ → WGS（与线上 vpn.negiao.cn 同构，仅换基址）
-        "/proxy/gcj2wgs/http://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}"
-      );
+    // ---- 建筑白模参考层（WGS84 GeoJSON，由服务端 /demo/data/ 提供）----
+    const buildingsSource = new ol.source.Vector();
+    const buildingsLayer = new ol.layer.Vector({
+      source: buildingsSource,
+      zIndex: 9,
+      // 低缩放级别下 3896 个面的描边会糊成一片红，14 级以下直接隐藏
+      minZoom: 14,
+      style: new ol.style.Style({
+        fill: new ol.style.Fill({ color: "rgba(255,255,255,0.5)" }),
+        stroke: new ol.style.Stroke({ color: "rgba(200,30,30,0.9)", width: 1 }),
+      }),
+    });
+    map.addLayer(buildingsLayer);
+
+    const DATA_URL = BASE + "/demo/data/forbidden-city-buildings.geojson";
+
+    fetch(DATA_URL)
+      .then((r) => {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      })
+      .then((geojson) => {
+        const features = new ol.format.GeoJSON().readFeatures(geojson, {
+          dataProjection: "EPSG:4326",
+          featureProjection: "EPSG:3857",
+        });
+        buildingsSource.addFeatures(features);
+        $buildInfo.textContent = "已加载 " + features.length + " 个建筑面（故宫 · WGS84）";
+        // 初始视图 = 白模范围
+        map.getView().fit(buildingsSource.getExtent(), {
+          padding: [175, 60, 60, 60],
+          maxZoom: 16,
+          duration: 0,
+        });
+      })
+      .catch((err) => {
+        $buildInfo.textContent = "建筑数据加载失败（" + err.message + "），视图回到故宫默认位置";
+        map.getView().setCenter(ol.proj.fromLonLat(HOME));
+        map.getView().setZoom(15);
+      });
+
+    $chkBuild.onchange = () => {
+      buildingsLayer.setVisible($chkBuild.checked);
+    };
+
+    function markOn(key) {
+      Object.keys(buttons).forEach((k) => buttons[k].classList.toggle("on", k === key));
+    }
+
+    // ---- 百度网格适配 ----
+    // 百度瓦片不是标准 XYZ：原点在中央、Y 轴向上、res=2^(18-z)（全世界恒为
+    // 67108864m 宽，与 XYZ 的 40075016m 不同）。直接把 {x}{y}{z} 当 XYZ 传进去
+    // 只会拿到空白（HTTP 200 + 全白）。
+    // 这里给百度源配一张自己的 tileGrid：原点取世界左上角、分辨率取 2^(18-z)，
+    // 再由 tileUrlFunction 把 OL 的列/行换回百度索引（行号翻转）。
+    // 瓦片按百度自己的网格摆放 → 内容相对 WGS 整体偏移，正是「原始」的对照效果。
+    const BD_ORIGIN = [-33554432, 33554432]; // 世界宽 67108864m 的一半
+    const bdResolutions = [];
+    for (let z = 1; z <= 18; z++) bdResolutions.push(Math.pow(2, 18 - z));
+    const bdTileGrid = new ol.tilegrid.TileGrid({
+      resolutions: bdResolutions,
+      origin: BD_ORIGIN,
+      tileSize: 256,
+    });
+
+    function baiduSource(attribution) {
+      return new ol.source.TileImage({
+        attributions: attribution || "",
+        tileGrid: bdTileGrid,
+        tileUrlFunction: function (tileCoord) {
+          const z = tileCoord[0] + 1; // bdResolutions 从百度 z=1 开始
+          const half = Math.pow(2, z - 1); // 该层级每轴瓦片数的一半
+          const tx = tileCoord[1] - half;
+          const ty = half - 1 - tileCoord[2]; // 百度网格 Y 轴向上 → 行号翻转
+          return BAIDU_TILE.replace("{x}", tx).replace("{y}", ty).replace("{z}", z);
+        },
+      });
+    }
+
+    // 唯一底图源：OSM 用内置 source（自带 attribution），百度走网格适配，
+    // 其余一律标准 XYZ 模板
+    function makeSource(url, attribution) {
+      if (url === MODES.osm.url) return new ol.source.OSM();
+      if (url === MODES.baiduRaw.url) return baiduSource(attribution);
+      return new ol.source.XYZ({ url: url, attributions: attribution || "" });
+    }
+
+    // 点示例 / 改 URL → 直接替换唯一底图的 source（输入框即当前底图 URL）
+    function show(url, label, key, attribution) {
+      tileLayer.setSource(makeSource(url, attribution));
+      $url.value = url || "";
+      $layer.textContent = label || "";
+      markOn(key || null);
+    }
+
+    Object.keys(MODES).forEach((key) => {
+      buttons[key].onclick = () => show(MODES[key].url, MODES[key].label, key, MODES[key].attr);
+    });
+
+    // 手动粘贴/编辑后加载
+    function loadFromInput() {
+      const value = $url.value.trim();
+      if (!value) return;
+      show(value, "当前图层：自定义模板（手动加载）", null, "");
+    }
+    document.getElementById("btnLoad").onclick = loadFromInput;
+    $url.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") loadFromInput();
+    });
+
+    // ---- 复制：优先 Clipboard API，非安全上下文退回 execCommand ----
+    async function copyText(text) {
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(text);
+          return true;
+        }
+      } catch (err) { /* 落到下面的兜底 */ }
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.top = "-1000px";
+      document.body.appendChild(ta);
+      ta.select();
+      let ok = false;
+      try { ok = document.execCommand("copy"); } catch (err) { ok = false; }
+      document.body.removeChild(ta);
+      return ok;
+    }
+
+    $copy.onclick = async () => {
+      const text = $url.value.trim();
+      if (!text) {
+        $copy.textContent = "先选示例";
+        setTimeout(() => { $copy.textContent = "复制"; }, 1200);
+        return;
+      }
+      const ok = await copyText(text);
+      $copy.textContent = ok ? "已复制 ✓" : "复制失败";
+      setTimeout(() => { $copy.textContent = "复制"; }, 1200);
+    };
+
+    // 打开页面就先给一份可直接复制的 URL
+    show(MODES.osm.url, MODES.osm.label, "osm", MODES.osm.attr);
   </script>
 </body>
 </html>

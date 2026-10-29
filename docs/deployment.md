@@ -40,7 +40,7 @@ curl http://127.0.0.1:9002/health
 curl -o g.png "http://127.0.0.1:9002/proxy/gcj2wgs/https://webrd02.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x=6920&y=3077&z=13"
 ```
 
-浏览器打开 `examples/openlayers-demo.html`，基址填 `http://127.0.0.1:9002`，点「高德 gcj2wgs」。
+浏览器打开 `http://127.0.0.1:9002/`（内置首页），点「高德 gcj2wgs」。
 
 Windows PowerShell：
 
@@ -69,10 +69,10 @@ docker run -d --name tile-proxy -p 127.0.0.1:9002:9002 \
 docker compose up -d
 ```
 
-从源码构建时：在 `docker-compose.yml` 里改回 `build: .`，或：
+从源码构建时：在 `docker-compose.yml` 里改回 `build: .` 后 `docker compose up -d --build`，或：
 
 ```bash
-docker build -t tile-proxy . && docker run --rm -p 127.0.0.1:9002:9002 tile-proxy
+docker build -t tile-proxy:1.1.0 . && docker run --rm -p 127.0.0.1:9002:9002 tile-proxy:1.1.0
 ```
 
 个人使用一般不必改 env；要压内存再抄 `.env.example`。
@@ -154,6 +154,7 @@ curl -s https://tiles.example.com/health   # 若配置了 /health 反代
 | 标签 | 说明 |
 |---|---|
 | `negiao/tile-proxy:latest` | 最新稳定 |
+| `negiao/tile-proxy:1.1.0` | 修复纠偏输出永久白斑；统一 Cache-Control；移除 ships66 |
 | `negiao/tile-proxy:1.0.0` | 首个开源版本 |
 
 ### C.1 单容器（预构建镜像）
@@ -169,11 +170,12 @@ docker run -d --name tile-proxy \
   negiao/tile-proxy:latest
 ```
 
-从源码构建：
+从源码构建（`--build-arg PIP_INDEX_URL=https://pypi.org/simple` 可切回官方源）：
 
 ```bash
-docker build -t tile-proxy .
-docker run -d --name tile-proxy -p 127.0.0.1:9002:9002 tile-proxy
+docker build -t tile-proxy:1.1.0 .
+docker run -d --name tile-proxy -p 127.0.0.1:9002:9002 tile-proxy:1.1.0
+docker inspect --format '{{.State.Health.Status}}' tile-proxy   # 镜像自带 HEALTHCHECK
 ```
 
 ### C.2 compose
@@ -190,6 +192,11 @@ curl http://127.0.0.1:9002/health
 ### C.3 与宿主机 nginx 组合
 
 ```nginx
+# 二级瓦片缓存（可选）。1.1.0 起不合格瓦片带 X-Tile-Blank: 1，
+# 必须让 nginx 跳过缓存，否则白斑会在本地缓存里留一整个 TTL。
+proxy_cache_path /var/cache/nginx/tiles levels=1:2 keys_zone=tiles:32m
+                 max_size=2g inactive=7d use_temp_path=off;
+
 location /proxy/ {
     proxy_pass http://127.0.0.1:9002;
     proxy_http_version 1.1;
@@ -198,10 +205,18 @@ location /proxy/ {
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
     proxy_read_timeout 30s;
+
+    proxy_cache tiles;
+    proxy_cache_valid 200 7d;
+    proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
+    proxy_cache_background_update on;
+    proxy_no_cache $upstream_http_x_tile_blank;      # 空白/不合格瓦片不入缓存
+    proxy_cache_bypass $upstream_http_x_tile_blank;
+    add_header X-Cache-Status $upstream_cache_status;
 }
 ```
 
-CORS 由应用返回 `Access-Control-Allow-Origin: *`，nginx 原样传递即可。
+CORS 由应用返回（默认 `Access-Control-Allow-Origin: *`），nginx 原样传递即可。
 
 ---
 

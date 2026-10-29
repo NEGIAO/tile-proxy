@@ -161,7 +161,9 @@ def _get_client_ip(request: Request) -> str:
 
 
 # 简单滑动窗口限流（每 IP 每分钟最多 N 次代理请求）
-# L2：Admin system_config `proxy_rate_limit` > env PROXY_RATE_LIMIT > catalog 默认 600
+# L2：Admin system_config `proxy_rate_limit` > env PROXY_RATE_LIMIT > 默认 0（不限流）
+# 默认关：这是自托管工具，一屏瓦片就有 20~30 个请求，限流太容易误伤；
+# 公网部署请显式设一个值（建议 ≥180），详见 docs/configuration.md。
 # 每次请求实时读取，管理员改完立即生效；0 = 不限流
 _rate_limit_store: Dict[str, List[float]] = defaultdict(list)
 _last_clean_time = time.time()
@@ -169,7 +171,7 @@ _last_clean_time = time.time()
 
 def _effective_rate_limit() -> int:
     """功能：读取当前代理限流阈值（L2 优先）。返回：>=0；0 表示不限流。"""
-    return get_effective_int("PROXY_RATE_LIMIT", 600, db_key="proxy_rate_limit", minimum=0, maximum=100000)
+    return get_effective_int("PROXY_RATE_LIMIT", 0, db_key="proxy_rate_limit", minimum=0, maximum=100000)
 
 
 def _rate_limit_check(request: Request) -> None:
