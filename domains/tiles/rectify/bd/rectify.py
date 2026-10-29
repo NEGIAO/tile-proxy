@@ -30,8 +30,10 @@ from PIL import Image
 from domains.tiles.rectify.common.grid import (
     _fetch_tile_grid,
     _merge_tiles,
-    _save_tile_bytes,
     _tile_cache_path,
+    assess_tile_quality,
+    load_output_cache,
+    save_output_cache,
 )
 from domains.tiles.rectify.common.quad import _quad_warp
 from domains.tiles.rectify.common.transform import bd2wgs, wgs2bd
@@ -169,8 +171,10 @@ async def get_bd2wgs_tile(
         PNG 瓦片字节
     """
     output_path = _tile_cache_path(cache_dir, template, "bd2wgs2", z, x, y)
-    if output_path.exists():
-        return output_path.read_bytes()
+    # 空白产物由 load_output_cache 判定为无效并清理，避免继续喂白图
+    cached = load_output_cache(output_path)
+    if cached is not None:
+        return cached
 
     # 1. 输出瓦片四角（WGS84）→ BD09 → 百度全局像素（Y 轴向上）。
     #    必须保留四角逐点坐标做 QUAD 变换：四角取极值压成轴对齐 box 会
@@ -196,13 +200,7 @@ async def get_bd2wgs_tile(
     tx_min, tx_max = math.floor(min(all_px) / TILE_SIZE), math.floor(max(all_px) / TILE_SIZE)
     ty_min, ty_max = math.floor(min(all_py) / TILE_SIZE), math.floor(max(all_py) / TILE_SIZE)
 
-    # 4. 拉取源网格并拼接（护栏/并发/缓存均在 common.grid._fetch_tile_grid 内）
-    tiles = await _fetch_tile_grid(
-        tx_min, tx_max, ty_min, ty_max, z_bd, template, cache_dir, "source-bd", client
-    )
-    composite = _merge_bd_tiles(tiles, tx_min, tx_max, ty_min, ty_max)
-
-    # 5. QUAD 重采样：合成图内 y 翻转后的精确四边形 → 256×256。
+    # 4/5. 拉取源网格 → 拼接 → QUAD 重采样（合成图内 y 翻转后的精确四边形 → 256×256）。
     #    共享边端点由同一地理角点算出，相邻瓦片 bit 级一致，严格无缝。
     top_in_grid = (ty_max + 1) * TILE_SIZE  # 合成图第 0 行对应的全局 py 上界
 
@@ -215,9 +213,28 @@ async def get_bd2wgs_tile(
         _to_composite(*px_rb),  # SE
         _to_composite(*px_rt),  # NE
     )
-    out = _quad_warp(composite, quad, _BD_RESAMPLE)
-    data = image_to_bytes(out)
-    _save_tile_bytes(output_path, data)
+
+    # 有效性校验 + 一次强制重取：不合格（大块透明 / 输出体积远小于源）说明源网格缺片，
+    # 直接落盘就会变成缓存 7 天的白斑。重取绕过源瓦片缓存。
+    data = b""
+    for attempt in (0, 1):
+        tiles = await _fetch_tile_grid(
+            tx_min, tx_max, ty_min, ty_max, z_bd, template, cache_dir, "source-bd",
+            client, force_refresh=bool(attempt),
+        )
+        composite = _merge_bd_tiles(tiles, tx_min, tx_max, ty_min, ty_max)
+        data = image_to_bytes(_quad_warp(composite, quad, _BD_RESAMPLE))
+        ok, why = assess_tile_quality(
+            data,
+            source_bytes_total=sum(len(t) for t in tiles),
+            source_pixels=len(tiles) * TILE_SIZE * TILE_SIZE,
+        )
+        if ok:
+            break
+        logger.warning(
+            "bd2wgs 输出不合格(%s)%s：z=%d x=%d y=%d", why,
+            "，强制重取" if attempt == 0 else "，重取后仍不合格", z, x, y)
+    save_output_cache(output_path, data)
     return data
 
 
@@ -246,8 +263,10 @@ async def get_wgs2bd_tile(
         PNG 瓦片字节
     """
     output_path = _tile_cache_path(cache_dir, template, "wgs2bd2", z, x, y)
-    if output_path.exists():
-        return output_path.read_bytes()
+    # 空白产物由 load_output_cache 判定为无效并清理，避免继续喂白图
+    cached = load_output_cache(output_path)
+    if cached is not None:
+        return cached
 
     # 1. 输出百度瓦片四角（BD09）→ WGS84（逐点保留，勿取极值压扁；
     #    同 bd2wgs，实测角点偏差达 0.71 源像素，是接缝台阶的根因）。
@@ -288,13 +307,7 @@ async def get_wgs2bd_tile(
     ty_min = max(0, min(math.floor(min(all_py) / TILE_SIZE), limit))
     ty_max = max(0, min(math.floor(max(all_py) / TILE_SIZE), limit))
 
-    # 4. 拉取源网格并拼接（标准 XYZ y 向下，行序与索引升序一致）
-    tiles = await _fetch_tile_grid(
-        tx_min, tx_max, ty_min, ty_max, z_src, template, cache_dir, "source-wgs", client
-    )
-    composite = _merge_tiles(tiles, tx_min, tx_max, ty_min, ty_max)
-
-    # 5. QUAD 重采样（标准 XYZ 像素方向与合成图一致，无需翻转）
+    # 4/5. 拉取源网格 → 拼接 → QUAD 重采样（标准 XYZ 像素方向与合成图一致，无需翻转）
     def _to_composite(px: float, py: float) -> Tuple[float, float]:
         return (px - tx_min * TILE_SIZE, py - ty_min * TILE_SIZE)
 
@@ -304,7 +317,24 @@ async def get_wgs2bd_tile(
         _to_composite(*px_rb),  # SE
         _to_composite(*px_rt),  # NE
     )
-    out = _quad_warp(composite, quad, _BD_RESAMPLE)
-    data = image_to_bytes(out)
-    _save_tile_bytes(output_path, data)
+
+    data = b""
+    for attempt in (0, 1):
+        tiles = await _fetch_tile_grid(
+            tx_min, tx_max, ty_min, ty_max, z_src, template, cache_dir, "source-wgs",
+            client, force_refresh=bool(attempt),
+        )
+        composite = _merge_tiles(tiles, tx_min, tx_max, ty_min, ty_max)
+        data = image_to_bytes(_quad_warp(composite, quad, _BD_RESAMPLE))
+        ok, why = assess_tile_quality(
+            data,
+            source_bytes_total=sum(len(t) for t in tiles),
+            source_pixels=len(tiles) * TILE_SIZE * TILE_SIZE,
+        )
+        if ok:
+            break
+        logger.warning(
+            "wgs2bd 输出不合格(%s)%s：z=%d x=%d y=%d", why,
+            "，强制重取" if attempt == 0 else "，重取后仍不合格", z, x, y)
+    save_output_cache(output_path, data)
     return data

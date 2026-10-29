@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
-"""直通瓦片路由：专用海图 + 通用流式代理。
+"""直通瓦片路由：通用流式代理 `/proxy/{target_url:path}`。
 
 内容整体搬自旧 `api/proxy.py`，逻辑逐字保留。
+1.1.0 起移除了 `/tiles/ships66/{z}/{x}/{y}.png` 专用海图端点
+（`SHIPS66_TILE_URL_TEMPLATE` 同步废弃）：它只是 `build_tile_url` 的
+一次性包装，用 `/proxy/{上游模板}` 即可等价表达。
 
 ⚠️ 注册顺序约束：必须后于 `routes_rectify` 挂载（见该模块文档）。
 """
@@ -13,7 +16,6 @@ import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from config import get_str
 from domains.tiles.proxy_shared import (
     PROXY_DEFAULT_REQUEST_HEADERS,
     PROXY_HOP_BY_HOP_HEADERS,
@@ -29,74 +31,12 @@ router = APIRouter()
 
 logger = logging.getLogger(__name__)
 
-# ==================== 专用海图代理 ====================
-@router.get("/tiles/ships66/{z}/{x}/{y}.png")
-async def ships66_tile(z: int, x: int, y: int, request: Request, _: None = Depends(_rate_limit_check)):
-    template = get_str("SHIPS66_TILE_URL_TEMPLATE", "")
-    if not template or "{z}" not in template:
-        raise HTTPException(status_code=503, detail="SHIPS66_TILE_URL_TEMPLATE 未配置")
-    upstream_url = template.format(z=z, x=x, y=y)
-    headers = {
-        "User-Agent": PROXY_DEFAULT_REQUEST_HEADERS["User-Agent"],
-        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-        "Accept-Language": "zh-CN,zh;q=0.9",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    }
-
-    client = getattr(request.app.state, "http_client", None)
-    fallback_client = None
-    if client is None:
-        fallback_client = httpx.AsyncClient(follow_redirects=False)
-        client = fallback_client
-
-    try:
-        upstream_request = client.build_request("GET", upstream_url, headers=headers)
-        upstream_response = await client.send(upstream_request, stream=True)
-
-        if upstream_response.status_code in (301, 302, 307, 308):
-            location = upstream_response.headers.get("location")
-
-            background = BackgroundTasks()
-            background.add_task(upstream_response.aclose)
-            if fallback_client:
-                background.add_task(fallback_client.aclose)
-
-            return Response(
-                status_code=upstream_response.status_code,
-                headers={"Location": location},
-                background=background,
-            )
-    except httpx.TimeoutException:
-        if fallback_client:
-            await fallback_client.aclose()
-        raise HTTPException(status_code=504, detail="瓦片请求超时")
-    except Exception as exc:
-        if fallback_client:
-            await fallback_client.aclose()
-        logger.error(f"海图瓦片请求失败: {exc!r}")
-        raise HTTPException(status_code=502, detail=str(exc))
-
-    response_headers = {
-        key: value
-        for key, value in upstream_response.headers.items()
-        if key.lower() not in PROXY_HOP_BY_HOP_HEADERS and key.lower() in PROXY_PASSTHROUGH_HEADERS
-    }
-
-    # ships66 纯中转不缓存，保持流式响应以降低峰值内存
-    background = BackgroundTasks()
-    background.add_task(upstream_response.aclose)
-    if fallback_client:
-        background.add_task(fallback_client.aclose)
-
-    return StreamingResponse(
-        upstream_response.aiter_raw(),
-        media_type=upstream_response.headers.get("content-type", "image/png"),
-        status_code=upstream_response.status_code,
-        headers=response_headers,
-        background=background,
-    )
-
+# 「上游讲的不是 TLS」类错误的特征串（OpenSSL / BoringSSL 两种措辞）
+_SCHEME_MISMATCH_MARKERS: tuple[str, ...] = (
+    "WRONG_VERSION_NUMBER",
+    "record layer failure",
+    "unknown protocol",
+)
 
 # ==================== 通用流式代理 ====================
 @router.get("/proxy/{target_url:path}")
@@ -142,6 +82,15 @@ async def universal_stream_proxy(target_url: str, request: Request, _: None = De
     except httpx.HTTPError as exc:
         if fallback_client is not None:
             await fallback_client.aclose()
+        hint = _scheme_hint(str(exc), target_url)
+        if hint:
+            # 用 400 而非 502：Cloudflare 会把源站的 5xx 换成自家「error code: 502」页，
+            # 真实原因到不了调用方；4xx 会原样透出 body，提示才看得见。
+            return JSONResponse(
+                status_code=400,
+                content={"detail": hint, "upstream": upstream_url, "error": str(exc)},
+                headers={"X-Proxy-Status": "SCHEME_MISMATCH"},
+            )
         return JSONResponse(
             status_code=502,
             content={"detail": "代理请求失败", "upstream": upstream_url, "error": str(exc)},
@@ -178,4 +127,25 @@ async def universal_stream_proxy(target_url: str, request: Request, _: None = De
         status_code=upstream_response.status_code,
         headers=response_headers,
         background=background_tasks,
+    )
+
+
+def _scheme_hint(error_text: str, raw_target: str) -> str:
+    """TLS 协议错配时给出可操作提示（返回空串表示不是该场景）。
+
+    背景：`_build_proxy_target_url` 对**不带协议**的 target 默认补 `https://`。
+    若上游其实是明文 HTTP（常见于 `IP:端口` 形式），握手会报
+    `SSL: WRONG_VERSION_NUMBER`，而 Cloudflare 会把源站 502 换成自家的
+    「error code: 502」页面，真实原因被藏掉——排查时极易误判成"代理坏了"。
+
+    只认「对方讲的是别的协议」这一类特征。证书校验失败（`SSLCertVerificationError`）
+    等其它 TLS 错误不走这条提示——那是另一码事，套用这套说辞反而误导。
+    """
+    if not any(marker in error_text for marker in _SCHEME_MISMATCH_MARKERS):
+        return ""
+    if str(raw_target or "").startswith(("http://", "https://")):
+        return ""
+    return (
+        "上游疑似明文 HTTP 却被按 https 访问（target 未带协议时默认补 https）。"
+        f"请显式带上协议，例如把 /proxy/{raw_target} 改为 /proxy/http://{raw_target}"
     )

@@ -48,6 +48,26 @@
 | `GCJRE_MAX_TILES_PER_REQUEST` | 64 | 网格片数上限（正常 2×2~3×3） |
 | `GCJRE_TILE_MAX_MB` | 8 | 单源片字节 |
 | `GCJRE_MAX_IMAGE_PIXELS` | 16777216 | 解码像素硬上限 |
+| `GCJRE_FETCH_ATTEMPTS` | 3 | 单源片取失败重试次数；用尽即抛错（路由返回 5xx，不进缓存） |
+| `GCJRE_BLANK_RETRY_SECONDS` | 600 | 空白源片缓存视为"软命中"的时限；超时后重新向上游取 |
+| `GCJRE_MAX_TRANSPARENT_PERCENT` | 10 | 输出透明像素占比上限，超过即判废并强制重取 |
+
+## 响应缓存（Cache-Control）
+
+纠偏与直通的 **200 + `image/*`** 响应统一由 `cache_policy` 中间件写入，
+覆盖上游原值并剥掉 `expires`/`pragma`：
+
+```
+Cache-Control: public, max-age=<浏览器>, s-maxage=<CDN 边缘>
+```
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `TILE_BROWSER_TTL_SECONDS` | 86400（1 天） | 浏览器 TTL。不宜过长——坏瓦片 purge 清得掉边缘、清不掉浏览器 |
+| `TILE_EDGE_TTL_SECONDS` | 604800（7 天） | `s-maxage`。与 CDN 缓存规则对齐；规则失效时仍能兜住 |
+
+> 空白/不合格瓦片（`X-Tile-Blank: 1`）会被改写成 `no-store`，不进任何一层缓存。
+> 若用 nginx 做二级缓存，记得加 `proxy_no_cache $upstream_http_x_tile_blank;`。
 
 ## 磁盘缓存
 
@@ -58,11 +78,18 @@
 | `GCJRE_CACHE_MAX_MB` | 2048 | 容量上限，超限删最旧；0=关 |
 | `GCJRE_CACHE_CLEANUP_INTERVAL_S` | 3600 | 后台清理间隔；0=关 |
 
-## 可选
+## 来源校验（防盗链，默认关闭）
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `SHIPS66_TILE_URL_TEMPLATE` | 空 | `/tiles/ships66/{z}/{x}/{y}.png` 上游模板 |
+| `TILE_PROXY_ENFORCE_ORIGIN` | `0` | 总开关。`0`=不挂载校验、CORS 全开放；`1`=启用白名单，CORS 也只放行白名单 |
+| `TILE_PROXY_ALLOWED_ORIGINS` | 内置白名单 | 逗号分隔的 origin；留空/全部非法时回落内置列表 |
+
+启用后判定规则：有 `Origin` 或 `Referer` 就必须在白名单内（否则 403）；两者都没有的请求
+（QGIS / ArcGIS Pro / curl / 服务端脚本）一律放行，本地与桌面端零配置。
+
+> 代价：白名单只在应用层生效。一旦启用 CDN 边缘缓存（见上一节），缓存键只有 URL，
+> 命中缓存的请求不再经过本进程，白名单在边缘层失效。真要强认证请另加令牌。
 
 ## 生产组合示例（1GB VPS）
 

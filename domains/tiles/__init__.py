@@ -18,7 +18,7 @@ domains/tiles/                 ← 迁移单元根（整夹拷贝）
   __init__.py                  包出口 + 本说明
   _router.py                   路由聚合（纠偏 → 通配，顺序不可打乱）
   routes_rectify.py            /proxy/{gcj2wgs,wgs2gcj,bd2wgs,wgs2bd}/…
-  routes_passthrough.py        /proxy/{target_url:path} + ships66
+  routes_passthrough.py        /proxy/{target_url:path}（通用流式代理）
   proxy_shared.py              内存 TTL 缓存 / 限流 / SSRF / 出站客户端
   cache_cleanup.py             磁盘缓存按龄+按容量清理 + 后台 loop
   infra/                       SSRF 护栏 + 浏览器出站头

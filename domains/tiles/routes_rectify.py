@@ -9,7 +9,7 @@
 """
 
 import logging
-from typing import Tuple
+from typing import Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -30,10 +30,60 @@ from domains.tiles.rectify import (
     get_wgs2gcj_tile,
     parse_tile_url,
 )
+from domains.tiles.rectify.common.grid import assess_tile_quality
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-logger = logging.getLogger(__name__)
+
+def _tile_response(
+    data: bytes,
+    media_type: str = "image/png",
+    *,
+    ok: Optional[bool] = None,
+) -> Response:
+    """纠偏瓦片的统一出口。
+
+    不合格的瓦片（大块透明 / 体积远小于源）打 `no-store` + `X-Tile-Blank: 1`：
+      * 浏览器/CF 不再把它缓存 7 天（cache_policy 中间件认这个标记）；
+      * nginx 侧 `proxy_no_cache $upstream_http_x_tile_blank` 同样跳过缓存。
+    这样即便重取后仍不合格，下一次请求也会重算，而不是白一整个缓存周期。
+
+    `ok` 是调用方已算好的质量结论；传 None 才在这里现算（避免同一张图
+    在"计算 → 落盘 → 出口"链路上被反复解码）。
+    """
+    if ok is None:
+        ok, _why = assess_tile_quality(data)
+    if not ok:
+        return Response(
+            content=data,
+            media_type=media_type,
+            headers={"Cache-Control": "no-store", "X-Tile-Blank": "1"},
+        )
+    return Response(content=data, media_type=media_type)
+
+
+def _finish_tile(cache_key: str, label: str, xyz, data: bytes) -> Response:
+    """校验 → 合格才写内存缓存 → 统一出口。
+
+    不合格的瓦片不进内存缓存：否则一次上游抖动会让同一块白斑在进程内
+    继续被命中 5 分钟（`PROXY_TILE_CACHE_TTL_SECONDS`），重试也没用。
+    """
+    ok, why = assess_tile_quality(data)
+    if ok:
+        _tile_cache.set(cache_key, data, "image/png")
+        logger.debug(
+            "瓦片缓存写入 [%s z=%d/x=%d/y=%d] 当前缓存: %d 条目",
+            label, xyz.z, xyz.x, xyz.y, _tile_cache.size,
+        )
+    else:
+        logger.warning(
+            "瓦片不合格(%s)，跳过内存缓存 [%s z=%d/x=%d/y=%d]",
+            why, label, xyz.z, xyz.x, xyz.y,
+        )
+    return _tile_response(data, ok=ok)
+
 
 def _resolve_gcj_cache_dir(request: Request):
     cache_dir = getattr(request.app.state, "gcj_rectify_cache_dir", None)
@@ -65,7 +115,8 @@ async def gcj2wgs_proxy(target_url: str, request: Request, _: None = Depends(_ra
     cached = _tile_cache.get(cache_key)
     if cached:
         logger.debug("瓦片缓存命中 [gcj2wgs z=%d/x=%d/y=%d]", xyz.z, xyz.x, xyz.y)
-        return Response(content=cached.content, media_type=cached.media_type)
+        # 内存缓存只收合格瓦片（见 _finish_tile），命中无需再解码校验
+        return _tile_response(cached.content, cached.media_type, ok=True)
 
     cache_dir = _resolve_gcj_cache_dir(request)
     client, should_close = _resolve_gcj_http_client(request)
@@ -86,9 +137,7 @@ async def gcj2wgs_proxy(target_url: str, request: Request, _: None = Depends(_ra
         if should_close:
             await client.aclose()
 
-    _tile_cache.set(cache_key, tile_bytes, "image/png")
-    logger.debug("瓦片缓存写入 [gcj2wgs z=%d/x=%d/y=%d] 当前缓存: %d 条目", xyz.z, xyz.x, xyz.y, _tile_cache.size)
-    return Response(content=tile_bytes, media_type="image/png")
+    return _finish_tile(cache_key, "gcj2wgs", xyz, tile_bytes)
 
 
 @router.get("/proxy/wgs2gcj/{target_url:path}")
@@ -104,7 +153,8 @@ async def wgs2gcj_proxy(target_url: str, request: Request, _: None = Depends(_ra
     cached = _tile_cache.get(cache_key)
     if cached:
         logger.debug("瓦片缓存命中 [wgs2gcj z=%d/x=%d/y=%d]", xyz.z, xyz.x, xyz.y)
-        return Response(content=cached.content, media_type=cached.media_type)
+        # 内存缓存只收合格瓦片（见 _finish_tile），命中无需再解码校验
+        return _tile_response(cached.content, cached.media_type, ok=True)
 
     cache_dir = _resolve_gcj_cache_dir(request)
     client, should_close = _resolve_gcj_http_client(request)
@@ -125,9 +175,7 @@ async def wgs2gcj_proxy(target_url: str, request: Request, _: None = Depends(_ra
         if should_close:
             await client.aclose()
 
-    _tile_cache.set(cache_key, tile_bytes, "image/png")
-    logger.debug("瓦片缓存写入 [wgs2gcj z=%d/x=%d/y=%d] 当前缓存: %d 条目", xyz.z, xyz.x, xyz.y, _tile_cache.size)
-    return Response(content=tile_bytes, media_type="image/png")
+    return _finish_tile(cache_key, "wgs2gcj", xyz, tile_bytes)
 
 
 # ==================== 百度 BD-09 瓦片纠偏代理 ====================
@@ -154,7 +202,8 @@ async def bd2wgs_proxy(target_url: str, request: Request, _: None = Depends(_rat
     cached = _tile_cache.get(cache_key)
     if cached:
         logger.debug("瓦片缓存命中 [bd2wgs z=%d/x=%d/y=%d]", xyz.z, xyz.x, xyz.y)
-        return Response(content=cached.content, media_type=cached.media_type)
+        # 内存缓存只收合格瓦片（见 _finish_tile），命中无需再解码校验
+        return _tile_response(cached.content, cached.media_type, ok=True)
 
     cache_dir = _resolve_gcj_cache_dir(request)
     client, should_close = _resolve_gcj_http_client(request)
@@ -175,9 +224,7 @@ async def bd2wgs_proxy(target_url: str, request: Request, _: None = Depends(_rat
         if should_close:
             await client.aclose()
 
-    _tile_cache.set(cache_key, tile_bytes, "image/png")
-    logger.debug("瓦片缓存写入 [bd2wgs z=%d/x=%d/y=%d] 当前缓存: %d 条目", xyz.z, xyz.x, xyz.y, _tile_cache.size)
-    return Response(content=tile_bytes, media_type="image/png")
+    return _finish_tile(cache_key, "bd2wgs", xyz, tile_bytes)
 
 
 @router.get("/proxy/wgs2bd/{target_url:path}")
@@ -198,7 +245,8 @@ async def wgs2bd_proxy(target_url: str, request: Request, _: None = Depends(_rat
     cached = _tile_cache.get(cache_key)
     if cached:
         logger.debug("瓦片缓存命中 [wgs2bd z=%d/x=%d/y=%d]", xyz.z, xyz.x, xyz.y)
-        return Response(content=cached.content, media_type=cached.media_type)
+        # 内存缓存只收合格瓦片（见 _finish_tile），命中无需再解码校验
+        return _tile_response(cached.content, cached.media_type, ok=True)
 
     cache_dir = _resolve_gcj_cache_dir(request)
     client, should_close = _resolve_gcj_http_client(request)
@@ -219,8 +267,6 @@ async def wgs2bd_proxy(target_url: str, request: Request, _: None = Depends(_rat
         if should_close:
             await client.aclose()
 
-    _tile_cache.set(cache_key, tile_bytes, "image/png")
-    logger.debug("瓦片缓存写入 [wgs2bd z=%d/x=%d/y=%d] 当前缓存: %d 条目", xyz.z, xyz.x, xyz.y, _tile_cache.size)
-    return Response(content=tile_bytes, media_type="image/png")
+    return _finish_tile(cache_key, "wgs2bd", xyz, tile_bytes)
 
 

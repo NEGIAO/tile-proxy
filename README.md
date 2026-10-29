@@ -1,10 +1,22 @@
 # tile-proxy
 
+[![版本](https://img.shields.io/badge/version-1.1.0-blue)](CHANGELOG.md)
+[![License](https://img.shields.io/badge/license-GPL--2.0--or--later-green)](LICENSE)
+[![Docker](https://img.shields.io/badge/docker-negiao%2Ftile--proxy-2496ED)](https://hub.docker.com/r/negiao/tile-proxy)
+
 **地图瓦片直通代理 + GCJ-02 / BD-09 → WGS84 纠偏**（FastAPI，可独立运行）。
 
 把国内加偏瓦片（高德/腾讯/天地图/百度）逐瓦片重采样成 **WGS84 标准 XYZ**；也可让境外服务器代拉 Google/Carto 等瓦片并解决 CORS。
 
 依赖仅 `fastapi` · `uvicorn` · `httpx` · `pillow`，适合 1GB 级 VPS，也适合本机一条命令跑通。
+
+> **v1.1.0（2026-10-29）**：修复「纠偏输出永久白斑」——上游抖动曾会把空白图逐层写进
+> 磁盘 / nginx / CDN（各 7 天），变成一块填不上的白斑。现在改为取片失败即 5xx（不进缓存）、
+> 输出侧做透明占比校验并强制重取一次、不合格响应带 `X-Tile-Blank: 1` + `no-store`。
+> 缓存头改由新增的 `cache_policy` 中间件统一写入（浏览器 1 天 / 边缘 7 天）；`origin_guard`
+> 不再打 `private`——`private` 会让共享缓存全部 BYPASS，与边缘缓存互斥。
+> 同时**移除** `/tiles/ships66/*` 与 `SHIPS66_TILE_URL_TEMPLATE`（用 `/proxy/{上游模板}` 等价替代）。
+> 详见 [CHANGELOG](CHANGELOG.md)。
 
 ## 效果展示（河南大学 · 高德电子图）
 
@@ -83,20 +95,22 @@ uvicorn app:app --host 127.0.0.1 --port 9002
 ```bash
 docker run -d --name tile-proxy -p 127.0.0.1:9002:9002 \
   -e PROXY_TILE_CACHE_MAX_SIZE=3000 -e PROXY_RATE_LIMIT=180 \
-  negiao/tile-proxy:latest
+  negiao/tile-proxy:1.1.0
 
 curl http://127.0.0.1:9002/health
 ```
 
-镜像：[`negiao/tile-proxy`](https://hub.docker.com/r/negiao/tile-proxy)（标签 `latest` / `1.0.0`）。
+镜像：[`negiao/tile-proxy`](https://hub.docker.com/r/negiao/tile-proxy)（标签 `latest` / `1.1.0` / `1.0.0`）。
 
 或 clone 后自行构建：
 
 ```bash
 docker compose up -d
 # 或
-docker build -t tile-proxy . && docker run --rm -p 127.0.0.1:9002:9002 tile-proxy
+docker build -t tile-proxy:1.1.0 . && docker run --rm -p 127.0.0.1:9002:9002 tile-proxy:1.1.0
 ```
+
+镜像自带 `HEALTHCHECK`（探 `/health`），`docker ps` 的 STATUS 列会显示 `(healthy)`。
 
 浏览器打开 [`examples/openlayers-demo.html`](examples/openlayers-demo.html)，基址填 `http://127.0.0.1:9002`，点「高德 gcj2wgs」即可对比纠偏效果。
 
@@ -169,7 +183,29 @@ new ol.layer.Tile({
 | `/proxy/wgs2bd/{url}` | WGS84 源 → 百度网格 |
 | `/health` | 探活 |
 
-CORS 默认 `*`。
+### 响应头约定（v1.1.0）
+
+所有 **200 + `image/*`** 响应统一改写缓存头（覆盖上游原值、剥掉 `expires`/`pragma`）：
+
+```text
+Cache-Control: public, max-age=86400, s-maxage=604800   # TILE_BROWSER_TTL_SECONDS / TILE_EDGE_TTL_SECONDS
+```
+
+浏览器只留 1 天（坏瓦片 purge 清得掉边缘、清不掉浏览器），CDN 边缘留 7 天。
+**不合格瓦片**（大块透明 / 体积远小于源）额外带：
+
+```text
+Cache-Control: no-store
+X-Tile-Blank: 1
+```
+
+用 nginx 做二级缓存时请加 `proxy_no_cache $upstream_http_x_tile_blank;`，否则白斑仍会被本地缓存住。
+
+### CORS 与防盗链
+
+默认 `Access-Control-Allow-Origin: *`，滥用防护交给 `PROXY_RATE_LIMIT` / `PROXY_MAX_CONNECTIONS`。
+需要只允许自有前端域名时，设 `TILE_PROXY_ENFORCE_ORIGIN=1`（白名单见
+`TILE_PROXY_ALLOWED_ORIGINS`）；不带 `Origin`/`Referer` 的请求（QGIS / ArcGIS Pro / curl）始终放行。
 
 ---
 
@@ -193,6 +229,8 @@ CORS 默认 `*`。
 
 ```
 app.py / config.py          入口与配置
+cache_policy.py             200 图片响应的 Cache-Control 统一改写（纯 ASGI 中间件）
+origin_guard.py             可选来源白名单（默认不挂载）
 domains/tiles/              纠偏库 + 代理路由 + SSRF/缓存清理
 deploy/                     systemd、nginx、install.sh
 Dockerfile · docker-compose.yml
