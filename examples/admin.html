@@ -1,0 +1,695 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>tile-proxy — 地图瓦片纠偏 / 直通代理 · 控制台</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root, html[data-theme="light"] {
+    --bg-main: #faf9f5; --bg-card: #fff; --bg-element: #f0eee6;
+    --border-color: #e6e3d9; --border-hover: #d1cdbf;
+    --text-primary: #191918; --text-secondary: #666560; --text-muted: #8f8e87;
+    --claude-orange: #da7756; --claude-orange-bg: #fdf3ef;
+    --status-green: #2e7d32; --status-green-bg: #edf7ed;
+    --status-red: #b3261e; --status-red-bg: #fdecea;
+    --status-amber: #8a5a00; --status-amber-bg: #fdf3e2;
+    --card-shadow: 0 1px 3px rgba(0,0,0,.02), 0 4px 12px rgba(0,0,0,.03);
+  }
+  html[data-theme="dark"] {
+    --bg-main: #141413; --bg-card: #1f1f1e; --bg-element: #2a2a28;
+    --border-color: #2e2d2a; --border-hover: #42413d;
+    --text-primary: #eceae5; --text-secondary: #a3a199; --text-muted: #73726c;
+    --claude-orange: #da7756; --claude-orange-bg: rgba(218,119,86,.12);
+    --status-green: #4ade80; --status-green-bg: rgba(74,222,128,.1);
+    --status-red: #f87171; --status-red-bg: rgba(248,113,113,.12);
+    --status-amber: #fbbf24; --status-amber-bg: rgba(251,191,36,.12);
+    --card-shadow: 0 2px 8px rgba(0,0,0,.2);
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family: Inter, -apple-system, "Segoe UI", Roboto, "Microsoft YaHei", sans-serif;
+    background: var(--bg-main); color: var(--text-primary);
+    min-height: 100vh; -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--claude-orange); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+  .header {
+    background: var(--bg-card); border-bottom: 1px solid var(--border-color);
+    padding: 12px 24px; display:flex; align-items:center; gap:14px;
+    position: sticky; top:0; z-index:50;
+  }
+  .brand { display:flex; align-items:center; gap:10px; }
+  .brand-icon {
+    width:28px; height:28px; background: var(--claude-orange); border-radius:8px;
+    display:flex; align-items:center; justify-content:center; color:#fff; font-size:14px;
+  }
+  .brand h1 { font-size:15px; font-weight:600; letter-spacing:-.01em; }
+  .brand span.sub { color: var(--text-muted); font-size:12px; margin-left:6px; }
+  .header .spacer { flex:1; }
+  .header a.navlink, .header button.navlink {
+    color: var(--text-secondary); text-decoration:none; font-size:13px;
+    padding:6px 12px; border:1px solid var(--border-color); border-radius:8px;
+    background: transparent; cursor:pointer; font-family: inherit;
+  }
+  .header a.navlink:hover, .header button.navlink:hover {
+    border-color: var(--border-hover); color: var(--text-primary); text-decoration:none;
+  }
+
+  .container { max-width: 980px; margin: 0 auto; padding: 24px 20px 60px; }
+  .hero {
+    background: var(--bg-card); border:1px solid var(--border-color); border-radius:14px;
+    padding: 28px 26px; box-shadow: var(--card-shadow); margin-bottom: 18px;
+  }
+  .hero h2 { font-size: 21px; font-weight: 700; margin-bottom: 10px; letter-spacing:-.02em; }
+  .hero p { color: var(--text-secondary); line-height: 1.65; font-size: 14px; }
+  .badges { display:flex; flex-wrap:wrap; gap:8px; margin: 14px 0 4px; }
+  .badge {
+    font-size:12px; padding:4px 10px; border-radius:999px;
+    background: var(--claude-orange-bg); color: var(--claude-orange); font-weight:600;
+  }
+  .badge.ok { background: var(--status-green-bg); color: var(--status-green); }
+  .badge.warn { background: var(--status-amber-bg); color: var(--status-amber); }
+  .badge.bad { background: var(--status-red-bg); color: var(--status-red); }
+  .badge.plain { background: var(--bg-element); color: var(--text-secondary); }
+
+  .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(250px,1fr)); gap:14px; margin-bottom:18px; }
+  .card {
+    background: var(--bg-card); border:1px solid var(--border-color); border-radius:14px;
+    padding: 20px 18px; box-shadow: var(--card-shadow); margin-bottom: 18px;
+    scroll-margin-top: 72px;
+  }
+  .card h3 { font-size:14px; font-weight:600; margin-bottom:10px; display:flex; align-items:center; gap:8px; }
+  .card h3 .dot { width:8px; height:8px; border-radius:50%; background: var(--claude-orange); }
+  .card p { font-size:13px; color: var(--text-secondary); line-height:1.6; }
+  .code {
+    display:block; margin-top:10px; padding:10px 12px; border-radius:8px;
+    background: var(--bg-element); color: var(--text-primary);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px; line-height:1.5; word-break: break-all; white-space: pre-wrap;
+  }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:9px 10px; border-bottom:1px solid var(--border-color); vertical-align: top; }
+  th { color: var(--text-muted); font-weight:500; font-size:12px; }
+  tr:last-child td { border-bottom:none; }
+  td code { font-size:12px; background: var(--bg-element); padding:2px 6px; border-radius:4px; }
+  .section-title { font-size:12px; font-weight:600; color:var(--text-muted); letter-spacing:.06em; text-transform:uppercase; margin: 0 0 12px; }
+  .btn {
+    display:inline-flex; align-items:center; gap:6px; padding:9px 16px; border-radius:10px;
+    background: var(--claude-orange); color:#fff; font-size:13px; font-weight:600;
+    border:1px solid transparent; cursor:pointer; font-family: inherit;
+  }
+  .btn.ghost { background: transparent; color: var(--text-primary); border-color: var(--border-color); }
+  .btn.small { padding:6px 12px; font-size:12.5px; border-radius:8px; }
+  .btn:hover { filter: brightness(1.05); }
+  .btn:disabled { opacity:.5; cursor: not-allowed; filter:none; }
+  input[type=text], input[type=password], input[type=number], select {
+    width:100%; padding:8px 10px; border:1px solid var(--border-color); border-radius:8px;
+    background: var(--bg-card); color: var(--text-primary); font: inherit; font-size:13px;
+  }
+  input:focus, select:focus { outline:2px solid var(--claude-orange-bg); border-color: var(--claude-orange); }
+  .note {
+    margin-top:14px; padding:11px 14px; border-radius:10px;
+    background: var(--status-green-bg); color: var(--status-green);
+    font-size:12.5px; line-height:1.55;
+  }
+  .footer { text-align:center; color:var(--text-muted); font-size:12px; margin-top:26px; }
+
+  /* ---- 状态条 ---- */
+  .statusbar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-top:14px; }
+  .stat {
+    display:flex; flex-direction:column; gap:2px; padding:10px 14px; border-radius:10px;
+    background: var(--bg-element); min-width:118px;
+  }
+  .stat .k { font-size:11px; color: var(--text-muted); }
+  .stat .v { font-size:14px; font-weight:600; }
+
+  /* ---- 表单 ---- */
+  .group { margin-bottom: 6px; }
+  .group-head {
+    display:flex; align-items:center; gap:8px; margin: 18px 0 10px;
+    font-size:13px; font-weight:600;
+  }
+  .group-head::after { content:""; flex:1; height:1px; background: var(--border-color); }
+  .field { display:grid; grid-template-columns: 210px 1fr; gap:12px; padding:10px 0; border-bottom:1px dashed var(--border-color); align-items:start; }
+  .field:last-child { border-bottom:none; }
+  .field .label { font-size:13px; font-weight:500; padding-top:6px; }
+  .field .label .unit { color: var(--text-muted); font-weight:400; font-size:12px; }
+  .field .ctl { display:flex; flex-direction:column; gap:6px; }
+  .field .help { font-size:12px; color: var(--text-muted); line-height:1.5; }
+  .field .row { display:flex; gap:8px; align-items:center; }
+  .field input[type=number] { max-width: 180px; }
+  .tag { font-size:11px; padding:2px 7px; border-radius:999px; font-weight:600; white-space:nowrap; }
+  .tag.hot { background: var(--status-green-bg); color: var(--status-green); }
+  .tag.restart { background: var(--status-amber-bg); color: var(--status-amber); }
+
+  /* ---- 开关 ---- */
+  .switch { position:relative; display:inline-block; width:44px; height:24px; flex:0 0 auto; }
+  .switch input { opacity:0; width:0; height:0; }
+  .switch .track {
+    position:absolute; inset:0; background: var(--border-hover); border-radius:999px;
+    transition: background .15s; cursor:pointer;
+  }
+  .switch .track::before {
+    content:""; position:absolute; width:18px; height:18px; left:3px; top:3px;
+    background:#fff; border-radius:50%; transition: transform .15s;
+    box-shadow: 0 1px 2px rgba(0,0,0,.25);
+  }
+  .switch input:checked + .track { background: var(--claude-orange); }
+  .switch input:checked + .track::before { transform: translateX(20px); }
+
+  /* ---- 登录 ---- */
+  .login { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .login input[type=password] { max-width: 260px; }
+  .locked-hint { color: var(--text-muted); font-size:13px; }
+
+  /* ---- toast ---- */
+  #toast {
+    position: fixed; left:50%; bottom:26px; transform: translateX(-50%) translateY(20px);
+    background: var(--text-primary); color: var(--bg-card); font-size:13px;
+    padding:10px 18px; border-radius:10px; opacity:0; pointer-events:none;
+    transition: opacity .2s, transform .2s; z-index: 100; max-width: 80vw;
+  }
+  #toast.show { opacity:1; transform: translateX(-50%) translateY(0); }
+  #toast.err { background: var(--status-red); color:#fff; }
+
+  @media (max-width: 720px) {
+    .field { grid-template-columns: 1fr; gap:6px; }
+    .field .label { padding-top:0; }
+  }
+</style>
+</head>
+<body>
+<header class="header">
+  <div class="brand">
+    <div class="brand-icon">◈</div>
+    <h1>tile-proxy<span class="sub">瓦片纠偏 / 直通代理</span></h1>
+  </div>
+  <div class="spacer"></div>
+  <a class="navlink" id="navHome" href="/">服务器控制台</a>
+  <a class="navlink" id="navDemo" href="/tile-proxy/" target="_blank" rel="noopener">地图演示</a>
+  <a class="navlink" href="/docs" target="_blank" rel="noopener">API 文档</a>
+  <a class="navlink" href="https://github.com/NEGIAO/tile-proxy" target="_blank" rel="noopener">GitHub</a>
+  <button class="navlink" id="themeBtn" type="button">深色</button>
+</header>
+
+<main class="container">
+  <!-- ==================== 概览 ==================== -->
+  <section class="hero">
+    <h2>地图瓦片直通代理 + 国内坐标纠偏</h2>
+    <p>
+      把高德 / 腾讯 / 天地图（GCJ-02）与百度（BD-09）瓦片，<strong>逐瓦片重采样</strong>成与 WGS84
+      标准 XYZ 对齐的 PNG，前端零改造即可叠加 GPS、OSM、Esri 等数据；也可由境外服务器代拉
+      Google / Carto 等瓦片并处理 CORS。本页同时是它的<strong>运行状态与配置控制台</strong>。
+    </p>
+    <div class="badges" id="badges">
+      <span class="badge plain">状态读取中…</span>
+    </div>
+    <div class="statusbar" id="statusbar"></div>
+  </section>
+
+  <!-- ==================== 接入说明 ==================== -->
+  <div class="grid">
+    <div class="card">
+      <h3><span class="dot"></span>GCJ-02 纠偏</h3>
+      <p>高德电子/影像为火星坐标，按标准 XYZ 直贴会整城偏移。经 <code>/proxy/gcj2wgs/</code> 输出后与 WGS 数据对齐。</p>
+      <code class="code">/proxy/gcj2wgs/http://webrd01.is.autonavi.com/appmaptile?…&amp;x={x}&amp;y={y}&amp;z={z}</code>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>百度 BD-09 纠偏</h3>
+      <p>百度网格非标准 XYZ（原点居中、Y 向上）。<code>bd2wgs</code> 跨网格重采样，索引用标准 XYZ。</p>
+      <code class="code">/proxy/bd2wgs/https://maponline0.bdimg.com/tile/?qt=vtile&amp;x={x}&amp;y={y}&amp;z={z}…</code>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>境外源直通</h3>
+      <p>浏览器直连 Google / Carto 等不稳定或无 CORS 时，由本服务代取并回源，补 UA / Referer。</p>
+      <code class="code">/proxy/a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png</code>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>路由一览</h3>
+    <table>
+      <thead><tr><th>路径</th><th>用途</th></tr></thead>
+      <tbody>
+        <tr><td><code>/health</code></td><td>探活</td></tr>
+        <tr><td><code>/proxy/{host+path}</code></td><td>通用直通</td></tr>
+        <tr><td><code>/proxy/gcj2wgs/{url}</code></td><td>GCJ 瓦片 → WGS84</td></tr>
+        <tr><td><code>/proxy/wgs2gcj/{url}</code></td><td>WGS84 → GCJ 网格</td></tr>
+        <tr><td><code>/proxy/bd2wgs/{url}</code></td><td>BD-09 → WGS84</td></tr>
+        <tr><td><code>/proxy/wgs2bd/{url}</code></td><td>WGS84 → 百度网格</td></tr>
+        <tr><td><code>/admin/status</code> · <code>/admin/login</code> · <code>/admin/config</code></td><td>本页用到的管理接口（写操作需登录令牌）</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h3>OpenLayers 接入（高德纠偏）</h3>
+    <code class="code">new ol.layer.Tile({
+  source: new ol.source.XYZ({
+    url: location.origin + "/proxy/gcj2wgs/" +
+      "http://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&amp;size=1&amp;scale=1&amp;style=8&amp;x={x}&amp;y={y}&amp;z={z}"
+  })
+});</code>
+    <p style="margin-top:12px">
+      之后 GPS 轨迹、GeoJSON、OSM 叠加层坐标保持 WGS84 原样即可。更多部署与原理见仓库
+      <a href="https://github.com/NEGIAO/tile-proxy" target="_blank" rel="noopener">README / docs</a>。
+    </p>
+  </div>
+
+  <!-- ==================== 管理 ==================== -->
+  <section class="card" id="adminCard">
+    <h3><span class="dot"></span>配置管理</h3>
+
+    <div id="setupBox" style="display:none">
+      <p style="margin-bottom:12px">
+        首次使用：请先为这个实例设置管理密码（至少 8 位）。密码只存
+        <strong>PBKDF2 哈希</strong>，不会保存明文；设置完成后才能修改配置。
+      </p>
+      <div class="login">
+        <input type="password" id="newPassword" placeholder="设置管理密码（≥8 位）" autocomplete="new-password" spellcheck="false">
+        <input type="password" id="newPassword2" placeholder="再输一次" autocomplete="new-password" spellcheck="false">
+        <button class="btn" id="setupBtn" type="button">完成初始化</button>
+        <span class="locked-hint" id="setupHint"></span>
+      </div>
+    </div>
+
+    <div id="loginBox">
+      <p style="margin-bottom:12px">修改配置需要管理密码。密码只存 PBKDF2 哈希（SQLite），登录后换取 12 小时有效的令牌。</p>
+      <div class="login">
+        <input type="password" id="password" placeholder="管理密码" autocomplete="current-password" spellcheck="false">
+        <button class="btn" id="loginBtn" type="button">登录</button>
+        <span class="locked-hint" id="loginHint"></span>
+      </div>
+    </div>
+
+    <div id="panelBox" style="display:none">
+      <div class="login" style="justify-content:space-between">
+        <span class="locked-hint" id="sessionHint"></span>
+        <span style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn ghost small" id="reloadBtn" type="button">重新读取</button>
+          <button class="btn ghost small" id="pwBtn" type="button">修改密码</button>
+          <button class="btn ghost small" id="logoutBtn" type="button">退出登录</button>
+        </span>
+      </div>
+
+      <div id="formBox"></div>
+
+      <div style="display:flex;gap:10px;align-items:center;margin-top:18px;flex-wrap:wrap">
+        <button class="btn" id="saveBtn" type="button" disabled>保存修改</button>
+        <button class="btn ghost" id="resetBtn" type="button">放弃改动</button>
+        <span class="locked-hint" id="dirtyHint"></span>
+      </div>
+
+      <div class="note" id="storeNote" style="display:none"></div>
+    </div>
+  </section>
+
+  <p class="footer">tile-proxy 线上实例 · 配置存于 <code class="mono">data/admin.db</code> · 开源仓库 NEGIAO/tile-proxy</p>
+</main>
+
+<div id="toast"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  // 页面在站点根下（/tile-proxy.html），管理接口挂在 nginx 的 /tile-proxy/ 前缀上
+  // 同一份文件两种部署形态都能用：
+  //   独立开源部署：控制台在 /admin，接口在 /admin/*（API = ""）
+  //   挂在站点 /tile-proxy/ 前缀下：控制台在 /tile-proxy.html，接口在 /tile-proxy/admin/*
+  // 注意要把 **.html 也认成站点形态**：只匹配 /tile-proxy/ 的话，线上打开
+  // /tile-proxy.html 会被判成「独立部署」，进而把「地图演示」指到站点根（服务器控制台）。
+  var PREFIX = /^\/tile-proxy(\.html)?(\/|$)/.test(location.pathname) ? "/tile-proxy" : "";
+  var API = location.origin + PREFIX;
+  var TOKEN_KEY = "tileProxyAdminToken";
+  var state = { token: localStorage.getItem(TOKEN_KEY) || "", schema: [], settings: {}, groups: [], dirty: {} };
+
+  var $ = function (id) { return document.getElementById(id); };
+  var toastTimer = null;
+
+  function toast(msg, isErr) {
+    var el = $("toast");
+    el.textContent = msg;
+    el.className = "show" + (isErr ? " err" : "");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { el.className = ""; }, 2600);
+  }
+
+  function fmtUptime(sec) {
+    sec = Math.max(0, Math.floor(sec || 0));
+    var d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), m = Math.floor((sec % 3600) / 60);
+    if (d) return d + " 天 " + h + " 小时";
+    if (h) return h + " 小时 " + m + " 分";
+    return m + " 分钟";
+  }
+
+  function api(path, opts) {
+    opts = opts || {};
+    opts.headers = opts.headers || {};
+    if (state.token) opts.headers["Authorization"] = "Bearer " + state.token;
+    if (opts.body) opts.headers["Content-Type"] = "application/json";
+    return fetch(API + path, opts).then(function (res) {
+      return res.text().then(function (text) {
+        var data = null;
+        try { data = text ? JSON.parse(text) : null; } catch (e) { data = { detail: text }; }
+        if (!res.ok) {
+          var err = new Error((data && data.detail) || ("HTTP " + res.status));
+          err.status = res.status;
+          throw err;
+        }
+        return data;
+      });
+    });
+  }
+
+  // ---------- 顶部状态 ----------
+  function renderStatus(st) {
+    var badges = $("badges");
+    badges.innerHTML = "";
+    function add(text, cls) {
+      var s = document.createElement("span");
+      s.className = "badge " + (cls || "plain");
+      s.textContent = text;
+      badges.appendChild(s);
+    }
+    add("v" + st.version, "plain");
+    add(st.proxy_enabled ? "代理运行中" : "代理已关闭", st.proxy_enabled ? "ok" : "bad");
+    if (st.rate_limit_enabled && st.rate_limit > 0) add("限流 " + st.rate_limit + " 次/分", "warn");
+    else add("未限流", "ok");
+    add("限流图 " + st.rate_limit_mode, "plain");
+
+    var bar = $("statusbar");
+    bar.innerHTML = "";
+    [
+      ["运行时长", fmtUptime(st.uptime_seconds)],
+      ["代理状态", st.proxy_enabled ? "开启" : "关闭"],
+      ["限流", st.rate_limit_enabled ? (st.rate_limit > 0 ? st.rate_limit + " 次/分" : "已开启但速率为 0") : "关闭"],
+      ["响应形态", st.rate_limit_mode]
+    ].forEach(function (kv) {
+      var d = document.createElement("div");
+      d.className = "stat";
+      d.innerHTML = '<span class="k"></span><span class="v"></span>';
+      d.querySelector(".k").textContent = kv[0];
+      d.querySelector(".v").textContent = kv[1];
+      bar.appendChild(d);
+    });
+  }
+
+  function loadStatus() {
+    return fetch(API + "/admin/status", { cache: "no-store" })
+      .then(function (r) { return r.json(); })
+      .then(function (st) { renderStatus(st); return st; })
+      .catch(function () {
+        $("badges").innerHTML = '<span class="badge bad">无法连接服务</span>';
+        return null;
+      });
+  }
+
+  // ---------- 表单 ----------
+  function buildField(item) {
+    var wrap = document.createElement("div");
+    wrap.className = "field";
+
+    var label = document.createElement("div");
+    label.className = "label";
+    label.textContent = item.label;
+    if (item.unit) {
+      var u = document.createElement("span");
+      u.className = "unit";
+      u.textContent = "（" + item.unit + "）";
+      label.appendChild(u);
+    }
+    wrap.appendChild(label);
+
+    var ctl = document.createElement("div");
+    ctl.className = "ctl";
+
+    var row = document.createElement("div");
+    row.className = "row";
+
+    var input;
+    if (item.type === "bool") {
+      var sw = document.createElement("label");
+      sw.className = "switch";
+      input = document.createElement("input");
+      input.type = "checkbox";
+      var track = document.createElement("span");
+      track.className = "track";
+      sw.appendChild(input);
+      sw.appendChild(track);
+      row.appendChild(sw);
+    } else if (item.type === "enum") {
+      input = document.createElement("select");
+      (item.options || []).forEach(function (opt) {
+        var o = document.createElement("option");
+        o.value = opt;
+        o.textContent = opt;
+        input.appendChild(o);
+      });
+      row.appendChild(input);
+    } else if (item.type === "int") {
+      input = document.createElement("input");
+      input.type = "number";
+      if (item.min !== null && item.min !== undefined) input.min = item.min;
+      if (item.max !== null && item.max !== undefined) input.max = item.max;
+      row.appendChild(input);
+      var hint = document.createElement("span");
+      hint.className = "locked-hint";
+      hint.style.fontSize = "12px";
+      if (item.min !== null && item.max !== null && item.min !== undefined && item.max !== undefined) {
+        hint.textContent = item.min + " ~ " + item.max;
+      }
+      row.appendChild(hint);
+    } else {
+      input = document.createElement("input");
+      input.type = "text";
+      row.appendChild(input);
+    }
+
+    input.dataset.key = item.key;
+    input.id = "f_" + item.key;
+
+    var tag = document.createElement("span");
+    tag.className = "tag " + (item.hot ? "hot" : "restart");
+    tag.textContent = item.hot ? "立即生效" : "重启后生效";
+    row.appendChild(tag);
+
+    ctl.appendChild(row);
+
+    if (item.help) {
+      var help = document.createElement("div");
+      help.className = "help";
+      help.textContent = item.help;
+      ctl.appendChild(help);
+    }
+    wrap.appendChild(ctl);
+
+    input.addEventListener("change", function () { onFieldChange(item, input); });
+    if (item.type === "int" || item.type === "text") {
+      input.addEventListener("input", function () { onFieldChange(item, input); });
+    }
+    return wrap;
+  }
+
+  function onFieldChange(item, input) {
+    var value = item.type === "bool" ? input.checked : input.value;
+    var original = state.settings[item.key];
+    var same = item.type === "bool" ? (!!value === !!original) : String(value) === String(original);
+    if (same) delete state.dirty[item.key];
+    else state.dirty[item.key] = value;
+    updateDirty();
+  }
+
+  function updateDirty() {
+    var n = Object.keys(state.dirty).length;
+    $("saveBtn").disabled = n === 0;
+    $("dirtyHint").textContent = n ? ("有 " + n + " 项待保存") : "没有改动";
+  }
+
+  function renderForm(payload) {
+    state.schema = payload.schema || [];
+    state.settings = payload.settings || {};
+    state.groups = payload.groups || [];
+    state.dirty = {};
+
+    var box = $("formBox");
+    box.innerHTML = "";
+
+    state.groups.forEach(function (group) {
+      var items = state.schema.filter(function (it) { return it.group === group; });
+      if (!items.length) return;
+      var g = document.createElement("div");
+      g.className = "group";
+      var head = document.createElement("div");
+      head.className = "group-head";
+      head.textContent = group;
+      g.appendChild(head);
+      items.forEach(function (item) {
+        var field = buildField(item);
+        g.appendChild(field);
+        var input = field.querySelector("[data-key]");
+        if (item.type === "bool") input.checked = !!state.settings[item.key];
+        else input.value = state.settings[item.key];
+      });
+      box.appendChild(g);
+    });
+
+    $("storeNote").style.display = "block";
+    $("storeNote").textContent = "配置存储：" + payload.store + "（密码为 PBKDF2 哈希，不存明文）";
+    updateDirty();
+  }
+
+  // ---------- 登录态 ----------
+  function showPanel(payload) {
+    $("setupBox").style.display = "none";
+    $("loginBox").style.display = "none";
+    $("panelBox").style.display = "block";
+    $("sessionHint").textContent = "已登录 · 令牌 12 小时有效";
+    renderForm(payload);
+  }
+
+  function showLogin(message) {
+    $("setupBox").style.display = "none";
+    $("loginBox").style.display = "block";
+    $("panelBox").style.display = "none";
+    $("loginHint").textContent = message || "";
+  }
+
+  function showSetup() {
+    $("setupBox").style.display = "block";
+    $("loginBox").style.display = "none";
+    $("panelBox").style.display = "none";
+  }
+
+  function loadConfig() {
+    return api("/admin/config")
+      .then(function (payload) { showPanel(payload); return payload; })
+      .catch(function (err) {
+        if (err.status === 401) {
+          state.token = "";
+          localStorage.removeItem(TOKEN_KEY);
+          showLogin("请先登录");
+        } else {
+          toast(err.message, true);
+        }
+      });
+  }
+
+  $("loginBtn").onclick = function () {
+    var pw = $("password").value;
+    if (!pw) { $("loginHint").textContent = "请输入密码"; return; }
+    $("loginBtn").disabled = true;
+    api("/admin/login", { method: "POST", body: JSON.stringify({ password: pw }) })
+      .then(function (res) {
+        state.token = res.token;
+        localStorage.setItem(TOKEN_KEY, res.token);
+        $("password").value = "";
+        $("loginHint").textContent = "";
+        showPanel(res.payload);
+        toast("登录成功");
+      })
+      .catch(function (err) { $("loginHint").textContent = err.message; })
+      .finally(function () { $("loginBtn").disabled = false; });
+  };
+  $("password").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") $("loginBtn").click();
+  });
+
+  $("logoutBtn").onclick = function () {
+    state.token = "";
+    localStorage.removeItem(TOKEN_KEY);
+    state.dirty = {};
+    showLogin("已退出登录");
+  };
+
+  $("reloadBtn").onclick = function () { loadConfig().then(function () { toast("已重新读取"); }); };
+  $("resetBtn").onclick = function () { loadConfig(); };
+
+  $("pwBtn").onclick = function () {
+    var oldPw = prompt("当前密码");
+    if (oldPw === null) return;
+    var newPw = prompt("新密码（至少 6 位）");
+    if (!newPw) return;
+    api("/admin/password", { method: "POST", body: JSON.stringify({ old: oldPw, new: newPw }) })
+      .then(function () {
+        toast("密码已更新，请重新登录");
+        state.token = "";
+        localStorage.removeItem(TOKEN_KEY);
+        showLogin("密码已更新，请用新密码登录");
+      })
+      .catch(function (err) { toast(err.message, true); });
+  };
+
+  $("saveBtn").onclick = function () {
+    if (!Object.keys(state.dirty).length) return;
+    $("saveBtn").disabled = true;
+    api("/admin/config", { method: "PUT", body: JSON.stringify({ settings: state.dirty }) })
+      .then(function (payload) {
+        renderForm(payload);
+        renderStatus(payload);
+        toast("已保存");
+      })
+      .catch(function (err) {
+        toast(err.message, true);
+        $("saveBtn").disabled = false;
+      });
+  };
+
+  // ---------- 主题 ----------
+  var savedTheme = localStorage.getItem("tileProxyTheme") || "light";
+  document.documentElement.setAttribute("data-theme", savedTheme);
+  $("themeBtn").textContent = savedTheme === "dark" ? "浅色" : "深色";
+  $("themeBtn").onclick = function () {
+    var next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+    document.documentElement.setAttribute("data-theme", next);
+    localStorage.setItem("tileProxyTheme", next);
+    $("themeBtn").textContent = next === "dark" ? "浅色" : "深色";
+  };
+
+  // ---------- 启动 ----------
+  // 两种部署形态下的链接指向
+  (function initNav() {
+    if (PREFIX) {
+      $("navHome").href = "/";
+      $("navHome").textContent = "服务器控制台";
+      $("navDemo").href = PREFIX + "/";
+      $("navDemo").style.display = "";
+    } else {
+      $("navHome").style.display = "none";       // 独立部署没有站点首页
+      $("navDemo").href = "/";
+      $("navDemo").textContent = "地图演示";
+    }
+  })();
+
+  // 首次使用：先设置密码
+  $("setupBtn").onclick = function () {
+    var p1 = $("newPassword").value, p2 = $("newPassword2").value;
+    if (p1.length < 8) { $("setupHint").textContent = "密码至少 8 位"; return; }
+    if (p1 !== p2) { $("setupHint").textContent = "两次输入不一致"; return; }
+    $("setupBtn").disabled = true;
+    api("/admin/setup", { method: "POST", body: JSON.stringify({ password: p1 }) })
+      .then(function (res) {
+        state.token = res.token;
+        localStorage.setItem(TOKEN_KEY, res.token);
+        $("newPassword").value = $("newPassword2").value = "";
+        showPanel(res.payload);
+        toast("初始化完成");
+        loadStatus();
+      })
+      .catch(function (err) { $("setupHint").textContent = err.message; })
+      .finally(function () { $("setupBtn").disabled = false; });
+  };
+
+  loadStatus().then(function (st) {
+    if (st && st.initialized === false) { showSetup(); return; }
+    if (state.token) loadConfig(); else showLogin("");
+  });
+})();
+</script>
+</body>
+</html>

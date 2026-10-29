@@ -82,8 +82,13 @@ def _rewrite(message):
     # 空白瓦片：调用方已用 X-Tile-Blank: 1 声明"这块是空的、别缓存"
     # （见 routes_rectify._tile_response）。此时绝不能套用 7 天策略，
     # 否则一次上游抖动就会把白斑钉在边缘/浏览器里一整个周期。
-    blank = any(k.lower() == b"x-tile-blank" and v.strip() == b"1"
-                for k, v in headers)
+    # 两个标记都算「别缓存」：X-Tile-Blank 是空白瓦片，X-Tile-NoCache 是限流提示图
+    # 之类的临时响应。CDN 是否认这个头另说（有的缓存规则会无视），nginx 侧一定能拦住。
+    blank = any(
+        (k.lower() == b"x-tile-blank" and v.strip() == b"1")
+        or (k.lower() == b"x-tile-nocache" and v.strip() == b"1")
+        for k, v in headers
+    )
     kept.append((b"cache-control",
                  b"no-store" if blank else tile_cache_control().encode("latin-1")))
 

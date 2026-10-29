@@ -29,7 +29,10 @@
 | 400 | URL 解析失败 / 护栏拒绝 / BD 索引越界 |
 | 403 | 目标主机被 SSRF 规则拒绝 |
 | 413 | 上游响应过大 |
-| 429 | 触发 `PROXY_RATE_LIMIT` |
+| **203（提示图）** | 默认。触发 `PROXY_RATE_LIMIT` 时，**瓦片请求返回 `203` + `assets/notices/error1.png`**，带 `X-Tile-Notice: error1`、`Retry-After`、`X-Tile-Blank: 1`、`X-Tile-NoCache: 1`、`Cache-Control: no-store`。浏览器 / OpenLayers 会正常渲染；203 也不在 nginx `proxy_cache_valid 200`、CF 默认可缓存状态码里，天然不落缓存。窗口一过同一 URL 立刻恢复正常瓦片 |
+| 200（提示图） | 同上，但状态码用 `200`——给只认 200 的客户端（Cesium 的 `ImageryProvider` 校验 `statusCode === 200`）。把 `PROXY_RATE_LIMIT_MODE` 设成 `image-200` 即可 |
+| 429 | 把 `PROXY_RATE_LIMIT_MODE` 设成 `json-429` 时，瓦片请求也返回 JSON；非瓦片路径（API 调用）始终是 JSON 429 + `Retry-After` |
+| 409 | 管理密码尚未初始化（此时 `POST /admin/login` 会被拒，需先 `POST /admin/setup`） |
 | 502 | 上游失败 |
 | 504 | 上游超时 |
 

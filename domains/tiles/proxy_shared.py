@@ -15,7 +15,14 @@ from urllib.parse import urlparse
 import httpx
 from fastapi import HTTPException, Request
 
-from config import get_bool, get_int, get_str, get_effective_int
+from config import (
+    get_bool,
+    get_int,
+    get_str,
+    get_effective_int,
+    rate_limit_enabled,
+    rate_limit_per_minute,
+)
 from .infra.http_headers import build_browser_headers, build_sec_ch_ua, referer_headers_for
 from .infra.net_guard import (
     host_matches_allowlist,
@@ -169,13 +176,31 @@ _rate_limit_store: Dict[str, List[float]] = defaultdict(list)
 _last_clean_time = time.time()
 
 
+class RateLimitExceeded(HTTPException):
+    """触发限流（HTTP 429）。
+
+    单独成类，是为了让 app 层能**只针对它**换成一张提示瓦片，其余 HTTPException
+    仍走 FastAPI 默认的 JSON 响应（API 调用方要的是可解析的错误体）。
+
+    `retry_after` 是「窗口真正空出来」的秒数，不是固定 60：第 N 个旧请求滑出
+    60s 窗口时就能恢复，客户端据此退避比盲等一分钟更准。
+    """
+
+    def __init__(self, retry_after: int = 60) -> None:
+        super().__init__(status_code=429, detail="Too many requests")
+        self.retry_after = max(1, int(retry_after))
+
+
 def _effective_rate_limit() -> int:
-    """功能：读取当前代理限流阈值（L2 优先）。返回：>=0；0 表示不限流。"""
-    return get_effective_int("PROXY_RATE_LIMIT", 0, db_key="proxy_rate_limit", minimum=0, maximum=100000)
+    """当前代理限流阈值（管理页数据库 > env PROXY_RATE_LIMIT）。0 表示不限流。"""
+    return rate_limit_per_minute()
 
 
 def _rate_limit_check(request: Request) -> None:
     global _last_clean_time
+    # 总开关：管理页关掉限流后直接放行（阈值仍可保留，方便再打开）
+    if not rate_limit_enabled():
+        return
     limit = _effective_rate_limit()
     if limit <= 0:
         return
@@ -198,7 +223,11 @@ def _rate_limit_check(request: Request) -> None:
 
     # 限制频率过高请求
     if len(_rate_limit_store[ip]) >= limit:
-        raise HTTPException(status_code=429, detail="Too many requests")
+        # 要回到 limit-1 个，得让最老的 (len - limit + 1) 条滑出窗口，
+        # 也就是下标 len-limit 那条过期即可（列表按时间升序）。
+        stamps = _rate_limit_store[ip]
+        wait = stamps[len(stamps) - limit] + 60.0 - now
+        raise RateLimitExceeded(retry_after=max(1, int(wait + 0.999)))
     _rate_limit_store[ip].append(now)
 
 
@@ -297,7 +326,7 @@ def _validate_proxy_target_url(upstream_url: str) -> None:
             raise HTTPException(status_code=403, detail="Target host resolves to a disallowed address")
 
 
-def _build_proxy_target_url(target_url: str, query: str) -> str:
+def _build_proxy_target_url(target_url: str, query: str, *, referer: str = "") -> str:
     normalized_target = str(target_url or "").strip().lstrip("/")
     if not normalized_target:
         raise HTTPException(status_code=400, detail="target_url 不能为空")
@@ -311,6 +340,20 @@ def _build_proxy_target_url(target_url: str, query: str) -> str:
     if compact_query:
         glue = "&" if "?" in upstream_url else "?"
         upstream_url = f"{upstream_url}{glue}{compact_query}"
+
+    # 防御：目标 URL 里嵌套了第二个完整 URL。典型成因是前端把「代理地址」拼到了
+    # 「上游地址」后面，例如
+    #   ...&z={z}http://127.0.0.1:9002/proxy/gcj2wgs/https://webrd01...&z={z}
+    # 这种地址上游必然 404，会被重试 3 次再 502，日志还很难看。直接 400 说清原因。
+    if upstream_url.count("://") > 1:
+        logger.warning(
+            "目标 URL 里嵌套了第二个 URL，拒绝转发：%s（referer=%s）",
+            upstream_url[:200], referer or "-",
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="target_url 里嵌套了第二个 URL（疑似把代理地址拼到了上游地址后面）",
+        )
 
     _validate_proxy_target_url(upstream_url)
     return upstream_url

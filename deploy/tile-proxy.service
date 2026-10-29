@@ -9,6 +9,11 @@ WorkingDirectory=/opt/tile-proxy
 Environment=PROXY_TILE_CACHE_MAX_SIZE=3000
 # 默认不限流；公网部署请改成一个具体值（建议 180~300）
 Environment=PROXY_RATE_LIMIT=0
+# 限流响应形态（image-203 / image-200 / json-429），首页开关可实时覆盖
+Environment=PROXY_RATE_LIMIT_MODE=image-203
+# 管理密码不在这里配：它存在 data/admin.db（PBKDF2 哈希），首次启动用
+# TILE_PROXY_ADMIN_PASSWORD 初始化（缺省 ttby8812），之后在控制台页面里改。
+
 Environment=GCJRE_CACHE=/var/cache/tile-proxy
 Environment=GCJRE_CACHE_MAX_MB=512
 Environment=GCJRE_CACHE_MAX_AGE_DAYS=3

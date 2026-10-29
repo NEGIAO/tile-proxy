@@ -1,0 +1,39 @@
+# 本地开发用 override：把源码挂进容器 + uvicorn --reload，改完保存即生效，不用 rebuild。
+#
+# 用法（二选一）：
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+#   docker compose -f docker-compose.dev.yml up -d --build     # 本文件已含完整定义
+#
+# 生产部署不要用这个文件（`--reload` 会多起一个 watcher 进程，且挂载源码没必要）。
+services:
+  tile-proxy:
+    build: .
+    image: negiao/tile-proxy:dev
+    container_name: tile-proxy
+    ports:
+      - "127.0.0.1:9002:9002"
+    environment:
+      PROXY_TILE_CACHE_MAX_SIZE: "3000"
+      PROXY_RATE_LIMIT: "0"
+      GCJRE_CACHE: /data/cache
+      GCJRE_CACHE_MAX_MB: "512"
+      GCJRE_CACHE_MAX_AGE_DAYS: "3"
+      PROXY_ALLOW_PRIVATE_HOSTS: "false"
+      # Windows / macOS 的 bind mount 不一定会把文件事件传进容器，
+      # 打开轮询兜底，否则改了代码不会触发 reload。
+      WATCHFILES_FORCE_POLLING: "true"
+    volumes:
+      - .:/app                          # ← 源码实时挂载（含 examples/ 与 assets/）
+      - tile-proxy-cache:/data/cache
+    command:
+      - uvicorn
+      - app:app
+      - --host=0.0.0.0
+      - --port=9002
+      - --reload
+      - --reload-dir=/app
+    restart: unless-stopped
+    mem_limit: 512m
+
+volumes:
+  tile-proxy-cache:

@@ -25,6 +25,8 @@ COPY *.py ./
 COPY domains ./domains
 # 内置首页（GET /）：示例页随镜像分发，容器起来直接打开根路径即可验证
 COPY examples ./examples
+# 提示瓦片（限流 429 / 缩放过大）
+COPY assets ./assets
 
 # 生产护栏默认（可用 -e 覆盖）
 # 限流默认关闭（PROXY_RATE_LIMIT=0）：本机/内网直接用不该被 429 误伤；
@@ -36,10 +38,12 @@ ENV PROXY_TILE_CACHE_MAX_SIZE=3000 \
     GCJRE_CACHE=/data/cache \
     GCJRE_CACHE_MAX_MB=512 \
     GCJRE_CACHE_MAX_AGE_DAYS=3 \
-    PROXY_ALLOW_PRIVATE_HOSTS=false
+    PROXY_ALLOW_PRIVATE_HOSTS=false \
+    TILE_PROXY_ADMIN_DB=/data/admin/admin.db
 
-RUN mkdir -p /data/cache
-VOLUME ["/data/cache"]
+# 管理配置库（密码哈希 + 运行时可改配置）必须落在卷上，否则容器重建就丢密码
+RUN mkdir -p /data/cache /data/admin
+VOLUME ["/data/cache", "/data/admin"]
 
 EXPOSE 9002
 

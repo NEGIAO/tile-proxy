@@ -12,7 +12,7 @@ import logging
 import time
 from io import BytesIO
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import httpx
 from PIL import Image
@@ -28,6 +28,20 @@ logger = logging.getLogger(__name__)
 # 并发数：原为 100（注释自述"实际不限制"）；P1-4 S2 收紧至 16，
 # 防单个纠偏请求打爆上游与本机 fd（重试机制仍由 fetch.py 处理限流错误）
 MAX_CONCURRENCY = get_int("GCJRE_MAX_CONCURRENCY", 16)
+
+# 全局回源并发闸门（跨请求共享）。原先是每个 `_fetch_tile_grid` 各建一个
+# `Semaphore(MAX_CONCURRENCY)`：一屏 30 张输出同时算时，能一次打出去 30×16=480 路，
+# 实际只靠 httpx 连接池（`PROXY_MAX_CONNECTIONS`，默认 80）兜底——既不可控，也容易
+# 把上游惹毛触发限流。改成模块级后，整个进程同一时刻最多 MAX_CONCURRENCY 路回源。
+_GLOBAL_FETCH_SEMAPHORE: Optional[asyncio.Semaphore] = None
+
+
+def _get_fetch_semaphore() -> asyncio.Semaphore:
+    """惰性创建全局回源信号量（避免在 import 阶段绑定事件循环）。"""
+    global _GLOBAL_FETCH_SEMAPHORE
+    if _GLOBAL_FETCH_SEMAPHORE is None:
+        _GLOBAL_FETCH_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENCY)
+    return _GLOBAL_FETCH_SEMAPHORE
 
 # --- SSRF/资源耗尽护栏（P1-4 S2；方案 Docs/TODO/proxy-ssrf-hardening-plan.md）---
 # 单瓦片字节上限：上游返回超大图时直接判废，避免进入解码
@@ -53,10 +67,11 @@ _MAX_TRANSPARENT_PERCENT = max(1, min(get_int("GCJRE_MAX_TRANSPARENT_PERCENT", 1
 # 输出体积与源瓦片的比值下限（字节/像素 之比）。纠偏是裁剪不是缩放，
 # 输出应当与源同量级；低于该比例说明输出丢了细节（纯色/纯透明）。
 _MIN_DETAIL_RATIO = 0.2
-# 源网格全不透明时，输出允许的透明像素占比上限。几何上 warp 只会从合成图内部
-# 取样，全不透明的输入不该产出任何透明像素；出现透明说明有源片被空白顶替，
-# 或采样越界（缺片漏边）。0.5% 给重采样核的边界留余量。
-_MAX_WARP_LEAK_PERCENT = 0.5
+# 输出透明率允许比源网格多出的百分点。几何上 warp 只从合成图内部取样，
+# 输出的透明区域应当与源网格的透明区域**一致**；多出来的透明就是缺片/漏边。
+# 不能用「源是否全不透明」做开关：实测 13241 个源片里有 395 个带 1~13 个透明像素
+# （高德 PNG 的边缘/水印），布尔判断会被它们轻易绕过，3.5% 的条带照样漏网。
+_MAX_EXTRA_TRANSPARENT_PCT = 1.0
 
 if _MAX_IMAGE_PIXELS > 0:
     # Pillow 的全局阈值：超过即抛 DecompressionBombError（而非仅 warning）
@@ -92,11 +107,6 @@ def _save_tile_bytes(tile_path: Path, tile_bytes: bytes) -> None:
     tile_path.write_bytes(tile_bytes)
 
 
-def _build_blank_tile() -> Image.Image:
-    """创建空白瓦片（RGBA）"""
-    return Image.new("RGBA", (TILE_SIZE, TILE_SIZE))
-
-
 def is_blank_tile_bytes(data: bytes, *, max_bytes: int = 2048) -> bool:
     """判断字节是否为「全透明空瓦片」。
 
@@ -116,12 +126,20 @@ def is_blank_tile_bytes(data: bytes, *, max_bytes: int = 2048) -> bool:
         return False
 
 
+def transparent_pct(image: "Image.Image") -> float:
+    """统计一张 RGBA 图里非全不透明像素的占比（%）。用 histogram，C 层实现，快。"""
+    rgba = image if image.mode == "RGBA" else image.convert("RGBA")
+    alpha = rgba.getchannel("A")
+    total = max(1, rgba.width * rgba.height)
+    return 100.0 * sum(alpha.histogram()[:255]) / total
+
+
 def assess_tile_quality(
     data: bytes,
     *,
     source_bytes_total: int = 0,
     source_pixels: int = 0,
-    source_opaque: bool = False,
+    source_transparent_pct: float = -1.0,
 ) -> Tuple[bool, str]:
     """评估一张纠偏输出是否可信，返回 (是否合格, 不合格原因)。
 
@@ -135,11 +153,11 @@ def assess_tile_quality(
        真实像素数，由调用方按 `片数 × TILE_SIZE²` 传入），缺一个就跳过该判据。
     3. **解码失败**：连图都不是，直接判废。
 
-    另有一条**不变量**（`source_opaque=True` 时生效）：源网格全不透明，输出却
-    有超过 `_MAX_WARP_LEAK_PERCENT` 的透明像素 → 判废。几何上 warp 只从合成图
-    内部取样，全不透明的输入产不出透明像素；出现透明就是有源片被空白顶替
-    （线上 z17/x=107151/y=51994 右侧 12.9% 透明带就是这种，7.9% 的透明率
-    没到 10% 阈值，于是被当成好片缓存了）。
+    另有一条**不变量**（`source_transparent_pct >= 0` 时生效）：输出的透明率不能
+    比源网格多出 `_MAX_EXTRA_TRANSPARENT_PCT` 个百分点。几何上 warp 只从合成图
+    内部取样，输出的透明区域应当与源一致；多出来的透明就是有源片被空白顶替
+    （线上 z17/x=107151/y=51994 右侧 12.9%、z11/x=1676/y=811 右侧 3.5% 的透明带
+    都是这种，透明率没到 10% 阈值，于是被当成好片缓存了）。
 
     注意：**不透明白色不算废**——那是上游真实的覆盖边界（卫星影像范围外），
     误判会让空白区域陷入无限重试。只认「透明」这个确定性信号。
@@ -158,11 +176,11 @@ def assess_tile_quality(
     alpha = rgba.getchannel("A")
     lo, _hi = alpha.getextrema()
     if lo == 0:
-        # 有透明像素才逐点统计；全不透明（lo=255）直接跳过，省一次遍历
-        transparent = sum(1 for v in alpha.getdata() if v == 0)
-        pct = 100.0 * transparent / total_px
-        if source_opaque and pct > _MAX_WARP_LEAK_PERCENT:
-            return False, "源片全不透明但输出 %.1f%% 透明（缺片/漏边）" % pct
+        # 口径必须与源侧一致（transparent_pct 数的是 alpha<255，这里也一样）：
+        # 只数 alpha==0 会漏掉 BILINEAR 在透明边缘混出来的半透明像素。
+        pct = transparent_pct(rgba)
+        if source_transparent_pct >= 0 and pct > source_transparent_pct + _MAX_EXTRA_TRANSPARENT_PCT:
+            return False, "输出透明 %.1f%% 比源 %.2f%% 多（缺片/漏边）" % (pct, source_transparent_pct)
         if pct > _MAX_TRANSPARENT_PERCENT:
             return False, "transparent %.1f%% > %d%%" % (pct, _MAX_TRANSPARENT_PERCENT)
 
@@ -212,6 +230,86 @@ def save_output_cache(output_path: Path, data: bytes) -> None:
     _save_tile_bytes(output_path, data)
 
 
+# ==================== 第一层校验：源瓦片 ====================
+class SourceTileError(RuntimeError):
+    """源瓦片不合格（空响应 / 过小 / 无法解码 / 全透明空白）。"""
+
+
+# 一张有效瓦片的字节下限：纯色 PNG 约 200B，全透明约 300B；低于这个数基本是
+# 错误页或截断响应。
+_SOURCE_MIN_BYTES = 100
+
+
+def _validate_source_tile(data: bytes, url: str) -> None:
+    """校验**单个源瓦片**能否用于合成（第一层判断，最关键的一层）。
+
+    四张源片里只要有一张是坏的，拼出来的输出就会缺一块（透明条带），而且会被
+    磁盘 / nginx / CDN 逐层放大。所以在**落盘之前**逐张把关：
+
+    1. 非空、字节数不低于 `_SOURCE_MIN_BYTES`（错误页 / 截断响应）
+    2. 能解码、尺寸合理（`Image.verify()` 抓截断与损坏；宽高 >= 32）
+    3. 不是「全透明空白片」——高德对无覆盖区返回的是**不透明白色/纯色**瓦片
+       （2026-10-29 抽查 z3/z5/z10/z13/z17 五个海洋与边缘瓦片，alpha 全 255），
+       所以全透明片只可能是上游抖动，不能当数据用。
+
+    不合格抛 `SourceTileError`，由 `_fetch_tile_grid` 重试（重试会绕过缓存）。
+    """
+    if not data:
+        raise SourceTileError("空响应：%s" % url)
+    if len(data) < _SOURCE_MIN_BYTES:
+        raise SourceTileError("响应过小（%d 字节）：%s" % (len(data), url))
+    try:
+        with Image.open(BytesIO(data)) as im:
+            w, h = im.size
+            im.verify()
+    except Exception as e:  # noqa: BLE001 - 任何解码失败都判不合格
+        raise SourceTileError("无法解码（%r）：%s" % (e, url))
+    # 必须是 256×256：`_merge_tiles` 是按网格位置直接 paste 的，尺寸不符会静默错位
+    if (w, h) != (TILE_SIZE, TILE_SIZE):
+        raise SourceTileError(
+            "尺寸异常 %dx%d（应为 %dx%d）：%s" % (w, h, TILE_SIZE, TILE_SIZE, url)
+        )
+    # 全透明判据直接看 alpha——不能用 is_blank_tile_bytes 的 2KB 体积预筛：
+    # 带元数据的空白 PNG 会超过 2KB 而漏检。
+    try:
+        with Image.open(BytesIO(data)) as im:
+            if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+                if im.convert("RGBA").getchannel("A").getextrema() == (0, 0):
+                    raise SourceTileError("全透明空白片：%s" % url)
+    except SourceTileError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise SourceTileError("无法解码（%r）：%s" % (e, url))
+
+
+# 同一源片的并发请求只打一次上游（单飞）。瓦片是连续的：一屏几十张输出瓦片
+# 共享同一批源片，没有这把锁时实测「16 张并发输出 → 25 张源片被请求 186 次」；
+# 有了它降到 25 次（理论最优）。
+_SOURCE_LOCKS: Dict[str, asyncio.Lock] = {}
+_SOURCE_LOCKS_MAX = 20000
+
+
+def _read_cached_tile(tile_path: Path) -> Optional[bytes]:
+    """读源片缓存。空白缓存只算「软命中」——超过 `_BLANK_RETRY_SECONDS` 就重取，
+    上游恢复后能自动覆盖，不至于让一次抖动钉死一整个缓存周期。"""
+    if not tile_path.exists():
+        return None
+    try:
+        cached = tile_path.read_bytes()
+    except OSError:
+        return None
+    if not is_blank_tile_bytes(cached):
+        return cached
+    try:
+        age = time.time() - tile_path.stat().st_mtime
+    except OSError:
+        age = 0
+    if age <= _BLANK_RETRY_SECONDS:
+        return cached
+    logger.info("空白瓦片缓存已超 %d 秒，重新向上游取：%s", _BLANK_RETRY_SECONDS, tile_path)
+    return None
+
+
 async def _get_tile_cached(
     x: int,
     y: int,
@@ -223,74 +321,51 @@ async def _get_tile_cached(
     client: Optional[httpx.AsyncClient],
     force_refresh: bool = False,
 ) -> bytes:
-    """获取单个瓦片（带文件缓存）
+    """取单个源瓦片：缓存 → 单飞 → 拉取 → **第一层校验** → 落盘。
 
-    优化：缓存命中时直接返回文件字节，避免解码/编码转换
-
-    force_refresh=True 时跳过缓存直接向上游取（用于"输出被判废、强制重取"）。
+    缓存命中直接返回文件字节，省掉解码/编码；`force_refresh=True` 时跳过缓存
+    （用于输出被判废后的强制重取）。同一源片的并发请求走同一把锁，只打一次上游。
     """
     tile_path = _tile_cache_path(cache_dir, template, category, z, x, y)
 
-    # 缓存命中：直接读取字节返回。
-    # 但空白缓存只能算"软命中"——超过 _BLANK_RETRY_SECONDS 就重新向上游要一次：
-    # 上游恢复后能取到真图并覆盖，避免一次抖动让该瓦片空白一整个缓存周期。
-    if tile_path.exists() and not force_refresh:
-        cached = tile_path.read_bytes()
-        blank = is_blank_tile_bytes(cached)
-        if not blank:
+    if not force_refresh:
+        cached = _read_cached_tile(tile_path)
+        if cached is not None:
             return cached
-        try:
-            age = time.time() - tile_path.stat().st_mtime
-        except OSError:
-            age = 0
-        if age <= _BLANK_RETRY_SECONDS:
-            return cached
-        logger.info("空白瓦片缓存已超 %d 秒，重新向上游取：%s", _BLANK_RETRY_SECONDS, tile_path)
 
-    # 缓存未命中：从上游获取
-    url = build_tile_url(template, x, y, z)
-    tile_bytes = await fetch_tile(url, client=client)
-    # P1-4 S2：先判字节上限，再进入解码/落盘（拒绝路径不写缓存）
-    _reject_oversized_tile_bytes(tile_bytes, url)
+    key = str(tile_path)
+    lock = _SOURCE_LOCKS.get(key)
+    if lock is None:
+        if len(_SOURCE_LOCKS) >= _SOURCE_LOCKS_MAX:
+            _SOURCE_LOCKS.clear()
+        lock = _SOURCE_LOCKS[key] = asyncio.Lock()
 
-    # 上游偶发返回空白片（限流/抖动，HTTP 200 + 全透明）。旧实现把它当正常片
-    # 拼进合成图，输出里对应那一块就是透明的；只要总透明率没过阈值，还会被
-    # 落盘 + CDN 各缓存 7 天（线上 z17/x=107151/y=51994、107153/y=51995 右侧
-    # 12.9% 透明带即此）。这里立即重取一次；仍空白就**抛错**，让上层重试或整块
-    # 返回 5xx（各层都不缓存），绝不让它进入合成图。
-    blank = is_blank_tile_bytes(tile_bytes)
-    if blank:
-        logger.info("源瓦片空白，立即重取一次：%s", url)
-        await asyncio.sleep(0.2)
+    async with lock:
+        # 二次检查：并发里的另一路可能刚刚把这张源片取回来并落盘
+        if not force_refresh:
+            cached = _read_cached_tile(tile_path)
+            if cached is not None:
+                return cached
+
+        url = build_tile_url(template, x, y, z)
         tile_bytes = await fetch_tile(url, client=client)
+        # P1-4 S2：先判字节上限，再进入解码/落盘（拒绝路径不写缓存）
         _reject_oversized_tile_bytes(tile_bytes, url)
-        blank = is_blank_tile_bytes(tile_bytes)
+        # ★ 第一层判断：源片本身必须可用，坏片绝不进合成图、也绝不落盘
+        _validate_source_tile(tile_bytes, url)
 
-    if blank:
-        # 为什么敢判死：高德（含卫星 webst01）对"无覆盖"区域返回的是**不透明白色/纯色**
-        # 瓦片，不是透明片（2026-10-29 抽查 z3/z5/z10/z13/z17 五个海洋与边缘瓦片，
-        # alpha 全为 255）。所以全透明片只可能是上游抖动，不能当数据用。
-        raise RuntimeError("上游返回空白（全透明）瓦片，拒绝拼接：%s" % url)
-
-    # 验证是有效图像后保存
-    try:
-        # 快速验证格式（检查 PNG/JPEG 魔数）
-        if _is_valid_image_bytes(tile_bytes):
-            _save_tile_bytes(tile_path, tile_bytes)
-        else:
-            # 需要转换格式
-            image = bytes_to_image(tile_bytes)
-            png_bytes = image_to_bytes(image)
-            _save_tile_bytes(tile_path, png_bytes)
-            return png_bytes
-    except (OSError, IOError) as e:
-        # 文件系统错误（权限、磁盘空间等）
-        logger.warning("Failed to save tile to cache: %s", e)
-    except Exception as e:
-        # 其他未预期的错误
-        logger.error("Unexpected error during tile validation: %s", e, exc_info=True)
-
-    return tile_bytes
+        try:
+            if _is_valid_image_bytes(tile_bytes):
+                _save_tile_bytes(tile_path, tile_bytes)
+            else:
+                png_bytes = image_to_bytes(bytes_to_image(tile_bytes))
+                _save_tile_bytes(tile_path, png_bytes)
+                return png_bytes
+        except (OSError, IOError) as e:
+            logger.warning("Failed to save tile to cache: %s", e)
+        except Exception as e:
+            logger.error("Unexpected error during tile validation: %s", e, exc_info=True)
+        return tile_bytes
 
 
 def _is_valid_image_bytes(data: bytes) -> bool:
@@ -328,22 +403,29 @@ async def _fetch_tile_grid(
     client: Optional[httpx.AsyncClient],
     force_refresh: bool = False,
 ) -> List[bytes]:
-    """并发获取瓦片网格
+    """并发获取瓦片网格（受全局信号量 `MAX_CONCURRENCY` 限流）
 
-    不限制并发，依赖 fetch.py 的重试机制处理限流错误（RemoteProtocolError）。
-    **单块瓦片取失败时不再用空白图顶替**：重试后仍失败就抛错，让整块请求以 5xx
-    结束（各层都不缓存），而不是产出会被缓存 7 天的白斑。
+    并发闸门是**进程级**的：所有请求共享同一批槽位，避免多张输出并发时
+    把上游打爆。限流错误仍由 fetch.py 的重试机制处理（RemoteProtocolError）。
+
+    **两层判断里的第一层就在这条路径上**：每张源片先过 `_validate_source_tile`
+    （空响应/过小/无法解码/全透明），不合格立刻抛错；这里重试 `_FETCH_ATTEMPTS`
+    次（重试绕过缓存），仍失败就整块抛错 → 路由返回 5xx（各层都不缓存），
+    绝不拿坏片去合成（那会产出被缓存 7 天的透明条带）。
     """
-    semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+    semaphore = _get_fetch_semaphore()
 
     async def _run(x: int, y: int) -> bytes:
         async with semaphore:
             last_exc: Optional[Exception] = None
             for attempt in range(_FETCH_ATTEMPTS):
                 try:
+                    # 第一层校验（_validate_source_tile）不合格会抛错；重试时
+                    # 绕过缓存重取——缓存里那份很可能就是刚被判废的坏片。
                     return await _get_tile_cached(
                         x, y, z, template, cache_dir, category,
-                        client=client, force_refresh=force_refresh,
+                        client=client,
+                        force_refresh=force_refresh or attempt > 0,
                     )
                 except Exception as e:  # noqa: BLE001 - 重试用尽后统一抛出
                     last_exc = e
@@ -400,6 +482,10 @@ def _merge_tiles(
     for i, _ in enumerate(range(x_min, x_max + 1)):
         for j, _ in enumerate(range(y_min, y_max + 1)):
             with Image.open(BytesIO(tiles[tile_index])) as tile:
+                if tile.size != (TILE_SIZE, TILE_SIZE):
+                    raise ValueError(
+                        "源瓦片尺寸 %s != %dx%d，拼接会错位" % (tile.size, TILE_SIZE, TILE_SIZE)
+                    )
                 composite.paste(tile.convert("RGBA"), (i * TILE_SIZE, j * TILE_SIZE))
             tile_index += 1
     return composite

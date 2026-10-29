@@ -11,6 +11,7 @@
 
 import logging
 from typing import Dict
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
@@ -31,6 +32,9 @@ router = APIRouter()
 
 logger = logging.getLogger(__name__)
 
+# 同源重定向最多跟几跳（防环）
+_MAX_REDIRECTS = 3
+
 # 「上游讲的不是 TLS」类错误的特征串（OpenSSL / BoringSSL 两种措辞）
 _SCHEME_MISMATCH_MARKERS: tuple[str, ...] = (
     "WRONG_VERSION_NUMBER",
@@ -42,7 +46,10 @@ _SCHEME_MISMATCH_MARKERS: tuple[str, ...] = (
 @router.get("/proxy/{target_url:path}")
 async def universal_stream_proxy(target_url: str, request: Request, _: None = Depends(_rate_limit_check)):
     """通用流式代理接口"""
-    upstream_url = _build_proxy_target_url(target_url, request.url.query)
+    upstream_url = _build_proxy_target_url(
+        target_url, request.url.query,
+        referer=request.headers.get("referer", ""),
+    )
 
     proxy_request_headers = _build_proxy_request_headers(request, upstream_url)
 
@@ -57,6 +64,26 @@ async def universal_stream_proxy(target_url: str, request: Request, _: None = De
     try:
         upstream_request = client.build_request("GET", upstream_url, headers=proxy_request_headers)
         upstream_response = await client.send(upstream_request, stream=True)
+
+        # 同源重定向自动跟随（最多 3 跳）。
+        # 典型场景：ESRI 的 WMTS 路径大小写不敏感、且旧版本号会 301 到新版本
+        # （`.../tile/26334/...` → `/arcgis/rest/services/world_imagery/.../tile/25285/...`），
+        # 而 301 的 Location 是**相对路径**——原样透给浏览器会被解析到我们自己的域名下，
+        # 于是 404。这里直接跟随，客户端拿到的就是最终瓦片。
+        # 只跟随**同 host**：跨域重定向仍按原样透传，不扩大 SSRF 面。
+        hops = 0
+        while upstream_response.status_code in (301, 302, 303, 307, 308) and hops < _MAX_REDIRECTS:
+            location = upstream_response.headers.get("location")
+            if not location:
+                break
+            next_url = urljoin(str(upstream_response.url), location)
+            if urlparse(next_url).netloc != urlparse(str(upstream_response.url)).netloc:
+                break
+            await upstream_response.aclose()
+            hops += 1
+            logger.debug("同源重定向跟随(%d)：%s", hops, next_url)
+            upstream_request = client.build_request("GET", next_url, headers=proxy_request_headers)
+            upstream_response = await client.send(upstream_request, stream=True)
 
         if upstream_response.status_code in (301, 302, 307, 308):
             location = upstream_response.headers.get("location")

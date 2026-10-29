@@ -154,7 +154,7 @@ curl -s https://tiles.example.com/health   # 若配置了 /health 反代
 | 标签 | 说明 |
 |---|---|
 | `negiao/tile-proxy:latest` | 最新稳定 |
-| `negiao/tile-proxy:1.1.0` | 修复纠偏输出永久白斑；统一 Cache-Control；移除 ships66 |
+| `negiao/tile-proxy:1.1.0` | 管理控制台（31 项运行配置）+ 内置联调页；修复纠偏输出永久白斑、统一 Cache-Control、移除 ships66 |
 | `negiao/tile-proxy:1.0.0` | 首个开源版本 |
 
 ### C.1 单容器（预构建镜像）
@@ -210,17 +210,60 @@ location /proxy/ {
     proxy_cache_valid 200 7d;
     proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
     proxy_cache_background_update on;
-    proxy_no_cache $upstream_http_x_tile_blank;      # 空白/不合格瓦片不入缓存
-    proxy_cache_bypass $upstream_http_x_tile_blank;
+    # 两个标记都跳过缓存：X-Tile-Blank = 空白/不合格瓦片，X-Tile-NoCache = 限流提示图
+    proxy_no_cache $upstream_http_x_tile_blank $upstream_http_x_tile_no_cache;
+    proxy_cache_bypass $upstream_http_x_tile_blank $upstream_http_x_tile_no_cache;
     add_header X-Cache-Status $upstream_cache_status;
 }
 ```
 
 CORS 由应用返回（默认 `Access-Control-Allow-Origin: *`），nginx 原样传递即可。
 
+### C.4 CDN 与提示瓦片：`no-store` 不一定被认（2026-10-29 实测）
+
+限流时服务端默认返回 **203 + `error1.png`**（`Cache-Control: no-store` + `X-Tile-Blank: 1` +
+`X-Tile-NoCache: 1`）；可在首页把 `PROXY_RATE_LIMIT_MODE` 切成 `image-200` 或 `json-429`。
+203 的好处是「能渲染但不在默认可缓存状态码里」：nginx `proxy_cache_valid 200` 和 CF 的
+默认可缓存状态码（200/206/301/302/303/404/410）都不含 203，等于多了一层天然保险。nginx 这一层一定能拦住，但 **CDN 未必**——如果 CDN 的缓存规则
+「忽略源站缓存头 + 用固定 TTL」，那么这张提示图会被按 URL 缓存整个 TTL（可能 7 天），
+**限流早就解除了，用户还在看「429 速率受限」**。
+
+实测（某 Cloudflare 配置，规则把 `/proxy/*` 设为 Cache Everything + 固定 Edge TTL）：
+
+| 变体 | 第 1 次 | 第 2 次 | 结论 |
+|---|---|---|---|
+| `no-store` | MISS | **HIT** | 被缓存 |
+| `no-store, private` | MISS | **HIT** | 被缓存 |
+| `no-store` + `Set-Cookie` | MISS | **HIT** | 被缓存 |
+
+也就是说：**源站加什么头都拦不住**，只能在 CDN 侧改规则。两种改法（任选一）：
+
+1. **推荐**：缓存规则里把 **Edge TTL 改成「Use origin cache-control」**（旧版 Page Rules 则是
+   Caching → Configuration → 打开 **Origin Cache Control**，并把 Edge Cache TTL 设为
+   "Use origin cache-control"）。瓦片仍按源站的 `s-maxage=604800` 缓存 7 天，
+   `no-store` 的提示图则不会被缓存。
+2. **最稳**：给 `/proxy/*` 设 **Bypass cache**。瓦片全部回源，由 nginx 的 7 天本地缓存兜住，
+   带宽略增但语义最干净。
+
+**验证方法**（改完 CDN 规则后跑一遍，两次用同一个 `_cb`）：
+
+```bash
+U="https://你的域名/proxy/gcj2wgs/https://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x=53956&y=24830&z=16&__cache_probe=1&_cb=test1"
+curl -sD - -o /dev/null "$U" | grep -i cf-cache-status   # 第 1 次：MISS / DYNAMIC
+curl -sD - -o /dev/null "$U" | grep -i cf-cache-status   # 第 2 次：仍应 MISS/DYNAMIC（不是 HIT）
+```
+
+`__cache_probe=1` 是内置的**缓存诊断探针**：返回一张 `200 + no-store` 的提示图，
+专门用来验证 CDN 到底认不认 `no-store`。不带这个参数时完全不可达，正常请求不受影响。
+
+
 ---
 
 ## D. 升级与运维
+
+> **备份**：`data/admin.db` 里存着管理密码哈希和所有运行时配置（限流速率、TTL、开关…），
+> 升级/迁移前请一并备份；Docker 部署它在 `/data/admin` 卷上（compose 名 `tile-proxy-admin`）。
+
 
 ```bash
 cd /opt/tile-proxy

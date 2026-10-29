@@ -18,6 +18,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response
 from PIL import Image
 
+from config import max_source_zoom
+from domains.tiles.notices import notice_response
 from domains.tiles.proxy_shared import (
     _build_proxy_target_url,
     _rate_limit_check,
@@ -38,6 +40,13 @@ from domains.tiles.rectify.common.url_template import TileUrlTemplate
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# 源瓦片的最大层级：超过它的请求上游必然没有数据（高德/百度矢量 18，百度 18），
+# 直接返回「级别过大」提示图，不去打上游。0 = 关闭该检查。
+# 注意：高德**卫星**在 z19 仍有影像，用卫星底图时可设成 19 或 0。
+# 每次请求实时读（管理页可改，改完立刻生效），env GCJRE_MAX_SOURCE_ZOOM 作兜底。
+def _max_source_zoom() -> int:
+    return max_source_zoom()
 
 # 构建函数签名：(xyz, template, cache_dir, client) -> 瓦片字节
 TileBuilder = Callable[[object, TileUrlTemplate, object, Optional[httpx.AsyncClient]], Awaitable[bytes]]
@@ -70,13 +79,20 @@ def _tile_response(
     return Response(content=data, media_type=media_type)
 
 
-def _finish_tile(cache_key: str, label: str, xyz, data: bytes) -> Response:
+def _finish_tile(cache_key: str, label: str, xyz, data: bytes, ok: Optional[bool] = None) -> Response:
     """校验 → 合格才写内存缓存 → 统一出口。
+
+    `ok` 由构建函数（`_build_with_quality` / bd 的循环）算出，带上了「与源网格
+    比较透明率」这条信息——那是出口这边拿不到的。传进来就直接用，省一次解码；
+    传 None（z≤9 直通、缓存命中）才在这里现算。
 
     不合格的瓦片不进内存缓存：否则一次上游抖动会让同一块白斑在进程内
     继续被命中 5 分钟（`PROXY_TILE_CACHE_TTL_SECONDS`），重试也没用。
     """
-    ok, why = assess_tile_quality(data)
+    if ok is None:
+        ok, why = assess_tile_quality(data)
+    else:
+        why = "构建期已判废" if not ok else "ok"
     if ok:
         _tile_cache.set(cache_key, data, "image/png")
         logger.debug(
@@ -124,11 +140,33 @@ async def _serve_tile(
         cache_prefix: 内存缓存键前缀（与 label 分开：便于后续换实现时不冲掉旧缓存）
         builder: 实际产出瓦片字节的协程函数
     """
-    upstream_url = _build_proxy_target_url(target_url, request.url.query)
+    upstream_url = _build_proxy_target_url(
+        target_url, request.url.query,
+        referer=request.headers.get("referer", ""),
+    )
     try:
         template, xyz = parse_tile_url(upstream_url)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # 缓存诊断探针：返回一张「200 + no-store + X-Tile-Blank」的提示图，用来验证
+    # 上游 CDN 到底认不认 no-store（2026-10-29 实测：某 CF 缓存规则会无视它，
+    # 见 docs/deployment.md「CDN 与提示瓦片」）。默认不可达，只有显式带
+    # `?__cache_probe=1` 才会命中，正常请求完全不受影响。
+    _probe = request.query_params.get("__cache_probe")
+    if _probe:
+        # `?__cache_probe=1` → 200；`?__cache_probe=203` → 203（用来对比 CDN 是否缓存）
+        return notice_response(
+            "error2", status_code=203 if _probe == "203" else 200,
+            cache_control="no-store, no-cache, must-revalidate, max-age=0",
+            headers={"X-Tile-Blank": "1", "X-Tile-NoCache": "1", "X-Tile-Notice": "cache-probe"},
+        )
+
+    # 层级过大：确定性结果，直接给提示图（200 + 可缓存），不消耗上游请求。
+    _zoom_limit = _max_source_zoom()
+    if _zoom_limit > 0 and xyz.z > _zoom_limit:
+        logger.debug("层级超出上限，返回提示图 [%s z=%d]", label, xyz.z)
+        return notice_response("error2", status_code=200)
 
     cache_key = f"{cache_prefix}:{template.cache_key}:{xyz.z}/{xyz.x}/{xyz.y}"
     cached = _tile_cache.get(cache_key)
@@ -140,7 +178,12 @@ async def _serve_tile(
     cache_dir = _resolve_gcj_cache_dir(request)
     client, should_close = _resolve_gcj_http_client(request)
     try:
-        tile_bytes = await builder(xyz, template, cache_dir, client)
+        result = await builder(xyz, template, cache_dir, client)
+        # 构建函数可以只返回 bytes，也可以返回 (bytes, ok) 把第一/二层的结论带出来
+        if isinstance(result, tuple):
+            tile_bytes, quality_ok = result
+        else:
+            tile_bytes, quality_ok = result, None
     except httpx.TimeoutException as exc:
         raise HTTPException(status_code=504, detail="纠偏请求超时") from exc
     except ValueError as exc:
@@ -154,7 +197,7 @@ async def _serve_tile(
         if should_close:
             await client.aclose()
 
-    return _finish_tile(cache_key, label, xyz, tile_bytes)
+    return _finish_tile(cache_key, label, xyz, tile_bytes, quality_ok)
 
 
 # ==================== GCJ 瓦片纠偏代理 ====================

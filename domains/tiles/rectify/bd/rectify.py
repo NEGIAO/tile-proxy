@@ -34,6 +34,7 @@ from domains.tiles.rectify.common.grid import (
     assess_tile_quality,
     load_output_cache,
     save_output_cache,
+    transparent_pct,
 )
 from domains.tiles.rectify.common.quad import _quad_warp
 from domains.tiles.rectify.common.transform import bd2wgs, wgs2bd
@@ -116,32 +117,6 @@ def _merge_bd_tiles(
     return composite
 
 
-def _crop_resize(composite: Image.Image, box: Tuple[float, float, float, float]) -> Image.Image:
-    """按像素级仿射框从合成图裁切并缩放到 256×256 输出瓦片。
-
-    .. deprecated::
-        轴对齐 box 近似已由 :func:`_quad_warp` 取代（相邻瓦片接缝错位 bug，
-        见本模块文档）。仅保留作退化兜底（四边形退化时）。
-
-    Args:
-        composite: 源网格合成图
-        box: (left, top, right, bottom) 合成图像素坐标（float，PIL resize box 语义）
-
-    Returns:
-        256×256 RGBA 输出瓦片；box 落在合成图外/过小时返回透明瓦片
-    """
-    left, top, right, bottom = box
-    left = max(0.0, min(left, composite.width))
-    right = max(0.0, min(right, composite.width))
-    top = max(0.0, min(top, composite.height))
-    bottom = max(0.0, min(bottom, composite.height))
-    if right - left < 0.5 or bottom - top < 0.5:
-        return Image.new("RGBA", (TILE_SIZE, TILE_SIZE))
-    return composite.resize(
-        (TILE_SIZE, TILE_SIZE), Image.LANCZOS, box=(left, top, right, bottom)
-    )
-
-
 # bd 双向的重采样核：跨网格降采样（约 306→256），用 BICUBIC 保细节；
 # gcj 双向同网格 1:1，用共用函数默认的 BILINEAR（更锐、更快）。
 _BD_RESAMPLE = Image.BICUBIC
@@ -155,7 +130,7 @@ async def get_bd2wgs_tile(
     cache_dir: Path,
     *,
     client: Optional[httpx.AsyncClient] = None,
-) -> bytes:
+) -> Tuple[bytes, bool]:
     """百度瓦片源 → WGS84 标准 XYZ 输出瓦片（bd2wgs 纠偏）。
 
     输出为 (x, y, z) 标准 XYZ 瓦片：前端以标准 XYZ 索引填充 URL 模板，
@@ -174,7 +149,7 @@ async def get_bd2wgs_tile(
     # 空白产物由 load_output_cache 判定为无效并清理，避免继续喂白图
     cached = load_output_cache(output_path)
     if cached is not None:
-        return cached
+        return cached, True
 
     # 1. 输出瓦片四角（WGS84）→ BD09 → 百度全局像素（Y 轴向上）。
     #    必须保留四角逐点坐标做 QUAD 变换：四角取极值压成轴对齐 box 会
@@ -214,13 +189,6 @@ async def get_bd2wgs_tile(
         _to_composite(*px_rt),  # NE
     )
 
-    quad = (
-        _to_composite(*px_lt),  # NW
-        _to_composite(*px_lb),  # SW
-        _to_composite(*px_rb),  # SE
-        _to_composite(*px_rt),  # NE
-    )
-
     # 有效性校验 + 一次强制重取：不合格（大块透明 / 输出体积远小于源）说明源网格缺片，
     # 直接落盘就会变成缓存 7 天的白斑。重取绕过源瓦片缓存。
     data = b""
@@ -235,15 +203,16 @@ async def get_bd2wgs_tile(
             data,
             source_bytes_total=sum(len(t) for t in tiles),
             source_pixels=len(tiles) * TILE_SIZE * TILE_SIZE,
-            source_opaque=composite.getchannel("A").getextrema() == (255, 255),
+            source_transparent_pct=transparent_pct(composite),
         )
         if ok:
             break
         logger.warning(
             "bd2wgs 输出不合格(%s)%s：z=%d x=%d y=%d", why,
             "，强制重取" if attempt == 0 else "，重取后仍不合格", z, x, y)
-    save_output_cache(output_path, data)
-    return data
+    if ok:
+        save_output_cache(output_path, data)
+    return data, ok
 
 
 async def get_wgs2bd_tile(
@@ -254,7 +223,7 @@ async def get_wgs2bd_tile(
     cache_dir: Path,
     *,
     client: Optional[httpx.AsyncClient] = None,
-) -> bytes:
+) -> Tuple[bytes, bool]:
     """WGS84 源 → 百度网格输出瓦片（wgs2bd 纠偏）。
 
     输出为 (x, y, z) 百度网格瓦片：客户端工作在百度坐标空间（如原生加载
@@ -274,7 +243,7 @@ async def get_wgs2bd_tile(
     # 空白产物由 load_output_cache 判定为无效并清理，避免继续喂白图
     cached = load_output_cache(output_path)
     if cached is not None:
-        return cached
+        return cached, True
 
     # 1. 输出百度瓦片四角（BD09）→ WGS84（逐点保留，勿取极值压扁；
     #    同 bd2wgs，实测角点偏差达 0.71 源像素，是接缝台阶的根因）。
@@ -338,12 +307,13 @@ async def get_wgs2bd_tile(
             data,
             source_bytes_total=sum(len(t) for t in tiles),
             source_pixels=len(tiles) * TILE_SIZE * TILE_SIZE,
-            source_opaque=composite.getchannel("A").getextrema() == (255, 255),
+            source_transparent_pct=transparent_pct(composite),
         )
         if ok:
             break
         logger.warning(
             "wgs2bd 输出不合格(%s)%s：z=%d x=%d y=%d", why,
             "，强制重取" if attempt == 0 else "，重取后仍不合格", z, x, y)
-    save_output_cache(output_path, data)
-    return data
+    if ok:
+        save_output_cache(output_path, data)
+    return data, ok

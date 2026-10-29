@@ -27,9 +27,12 @@ services:
       # TILE_PROXY_ALLOWED_ORIGINS: "https://webgis.negiao.cn,http://localhost:5173"
     volumes:
       - tile-proxy-cache:/data/cache
+      # 管理配置库（密码哈希 + 可改配置）；删掉它 = 重置管理密码
+      - tile-proxy-admin:/data/admin
     restart: unless-stopped
     mem_limit: 256m
     # 镜像自带 HEALTHCHECK（/health），无需在此重复声明
 
 volumes:
   tile-proxy-cache:
+  tile-proxy-admin:
