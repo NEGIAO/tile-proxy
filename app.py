@@ -57,7 +57,7 @@ logger = logging.getLogger("tile-proxy")
 
 # 版本唯一真源：FastAPI 的 /openapi.json、/health、内置首页的版本角标都取这里。
 # 发版时同步 pyproject.toml / Dockerfile LABEL / CHANGELOG / README 徽章。
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 # 进程启动时间（管理页展示 uptime）
 STARTED_AT = time.time()

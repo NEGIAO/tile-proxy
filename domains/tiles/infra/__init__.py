@@ -6,13 +6,17 @@
 """
 
 from .http_headers import (
+    BROWSER_FINGERPRINT_HEADERS,
     BROWSER_USER_AGENT,
+    IDENTIFIED_UA_BY_DOMAIN,
     SEC_CH_UA,
     build_browser_headers,
     build_browser_headers_no_br,
     build_sec_ch_ua,
+    identified_ua_for,
     referer_headers_for,
 )
+from .tile_fingerprint import IdenticalTileDetector, get_detector
 from .net_guard import (
     LOCAL_HOSTNAMES,
     LOCAL_HOST_SUFFIXES,
@@ -26,6 +30,11 @@ from .net_guard import (
 )
 
 __all__ = [
+    "BROWSER_FINGERPRINT_HEADERS",
+    "IDENTIFIED_UA_BY_DOMAIN",
+    "IdenticalTileDetector",
+    "get_detector",
+    "identified_ua_for",
     "BROWSER_USER_AGENT",
     "SEC_CH_UA",
     "build_browser_headers",

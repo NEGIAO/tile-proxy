@@ -23,7 +23,13 @@ from config import (
     rate_limit_enabled,
     rate_limit_per_minute,
 )
-from .infra.http_headers import build_browser_headers, build_sec_ch_ua, referer_headers_for
+from .infra.http_headers import (
+    BROWSER_FINGERPRINT_HEADERS,
+    build_browser_headers,
+    build_sec_ch_ua,
+    identified_ua_for,
+    referer_headers_for,
+)
 from .infra.net_guard import (
     host_matches_allowlist,
     is_disallowed_host,
@@ -410,6 +416,24 @@ async def _limited_stream(upstream_response: httpx.Response, upstream_url: str) 
 
 def _build_proxy_request_headers(request: Request, upstream_url: str) -> Dict[str, str]:
     headers = dict(PROXY_DEFAULT_REQUEST_HEADERS)
+
+    # 社区瓦片源（OSM 等）：必须以「应用自身身份」出现，不得冒充浏览器。
+    # 政策禁止 impersonate a browser 与「把所有客户端藏在单一匿名身份后面」，
+    # 而浏览器兼容头（Chrome UA + sec-ch-ua + Sec-Fetch-*）恰好同时违反这两条 ——
+    # 这是 2026-10-30 OSM 返回「403 Access blocked」提示图的直接原因。
+    identified_ua = identified_ua_for(upstream_url)
+    if identified_ua:
+        headers["User-Agent"] = identified_ua
+        for header_name in BROWSER_FINGERPRINT_HEADERS:
+            headers.pop(header_name, None)
+        headers.pop("Accept-Language", None)
+        # Referer 必须端到端保留：政策原文 "If you proxy tile requests through
+        # your servers or a CDN, do not strip or blank the Referer"。
+        incoming_referer = request.headers.get("Referer")
+        if incoming_referer:
+            headers["Referer"] = incoming_referer
+        return headers
+
     # 透传集合：浏览器客户端发起的请求携带标准浏览器头时直接透传；
     # 非浏览器客户端（脚本/探针）未携带的字段由默认头补齐，保证各瓦片源兼容。
     # UA 仅当客户端表现为浏览器（Mozilla/ 前缀）时才透传，否则使用默认 UA。

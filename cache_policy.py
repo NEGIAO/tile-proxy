@@ -87,6 +87,9 @@ def _rewrite(message):
     blank = any(
         (k.lower() == b"x-tile-blank" and v.strip() == b"1")
         or (k.lower() == b"x-tile-nocache" and v.strip() == b"1")
+        # X-Tile-Suspect：直通路由判定「不同瓦片返回同一份字节」（拦截图/占位图），
+        # 同样是错误内容，绝不能套 7 天策略把它钉在边缘。
+        or (k.lower() == b"x-tile-suspect" and v.strip() == b"1")
         for k, v in headers
     )
     kept.append((b"cache-control",

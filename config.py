@@ -127,6 +127,18 @@ _item("PROXY_TILE_CACHE_MAX_SIZE", "进程内缓存条数", "缓存", "int", "30
 _item("PROXY_TILE_CACHE_TTL_SECONDS", "进程内缓存时长", "缓存", "int", "300",
       unit="秒", minimum=0, maximum=86400,
       help="内存缓存条目的存活时间。")
+_item("PROXY_IDENTICAL_TILE_DETECT", "相同字节瓦片检测", "缓存", "bool", "1", hot=True,
+      help="开启后比对响应体指纹：同一上游若有多个不同瓦片返回完全相同的字节，"
+           "判定为拦截图/占位图，该响应不再走长缓存（no-store）并记 WARNING。"
+           "OSM 的「403 Access blocked」提示图就是 200 + image/png，只能靠此方式识别。")
+_item("PROXY_IDENTICAL_TILE_THRESHOLD", "相同字节判定阈值", "缓存", "int", "12", hot=True,
+      unit="片", minimum=2, maximum=200,
+      help="同一 host 下同一个指纹命中多少个不同 URL 即判定异常。"
+           "调低更快发现、但纯色海域等本就相同的瓦片可能被误判（代价仅是不走缓存）。")
+_item("PROXY_SUSPECT_SCAN_MAX_KB", "参与检测的体积上限", "缓存", "int", "64", hot=True,
+      unit="KB", minimum=1, maximum=1024,
+      help="超过该体积的响应不参与指纹检测、保持流式转发。"
+           "拦截图/占位图通常只有几 KB，64KB 足以覆盖且不会把大图读进内存。")
 _item("GCJRE_CACHE_MAX_MB", "磁盘缓存上限", "缓存", "int", "512",
       unit="MB", minimum=0, maximum=65536,
       help="纠偏源片/输出瓦片的磁盘缓存上限。")

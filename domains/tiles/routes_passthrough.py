@@ -9,14 +9,17 @@
 ⚠️ 注册顺序约束：必须后于 `routes_rectify` 挂载（见该模块文档）。
 """
 
+import hashlib
 import logging
-from typing import Dict
+from typing import Dict, Optional
 from urllib.parse import urljoin, urlparse
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from config import get_bool, get_int
+from domains.tiles.infra.tile_fingerprint import get_detector
 from domains.tiles.proxy_shared import (
     PROXY_DEFAULT_REQUEST_HEADERS,
     PROXY_HOP_BY_HOP_HEADERS,
@@ -149,12 +152,86 @@ async def universal_stream_proxy(target_url: str, request: Request, _: None = De
             await fallback_client.aclose()
         raise
 
+    # 「相同字节」检测：OSM 拦截图这类固定占位图是 200 + image/*，状态码完全看不出来，
+    # 只能靠跨请求比对响应体指纹。小体积响应整体读出后判定，命中即放弃长缓存。
+    scanned_body = await _scan_identical_tile(upstream_url, upstream_response, response_headers)
+    if scanned_body is not None:
+        # 长度交给 Starlette 按实际 body 重算，避免与上游声明值打架
+        response_headers.pop("content-length", None)
+        return Response(
+            content=scanned_body,
+            status_code=upstream_response.status_code,
+            headers=response_headers,
+            background=background_tasks,
+        )
+
     return StreamingResponse(
         _limited_stream(upstream_response, upstream_url),
         status_code=upstream_response.status_code,
         headers=response_headers,
         background=background_tasks,
     )
+
+
+async def _scan_identical_tile(
+    upstream_url: str,
+    upstream_response: httpx.Response,
+    response_headers: Dict[str, str],
+) -> Optional[bytes]:
+    """小体积瓦片整体读出，并做「不同瓦片返回同一份字节」判定。
+
+    Args:
+        upstream_url: 上游 URL（取 host 做分组统计）。
+        upstream_response: httpx 流式响应，调用方须保证 body 尚未被读取。
+        response_headers: 待回给客户端的响应头，判定命中时就地追加标记。
+
+    Returns:
+        读出的 body（调用方改用普通 Response 返回）；None 表示不参与检测、继续流式转发。
+
+    核心逻辑：只处理 200 + image/* + 声明长度不超过扫描上限的响应 —— 拦截图与占位图
+    恰恰都是小体积；大图（正射影像、模型预览）不进内存，保留原有流式转发行为。
+    命中后打 X-Tile-Suspect / X-Tile-NoCache，由 cache_policy 降级为 no-store。
+    """
+    if not get_bool("PROXY_IDENTICAL_TILE_DETECT", True):
+        return None
+    if upstream_response.status_code != 200:
+        return None
+    content_type = upstream_response.headers.get("content-type", "")
+    if not content_type.lower().startswith("image/"):
+        return None
+
+    declared = upstream_response.headers.get("content-length")
+    if not declared:
+        return None
+    try:
+        declared_bytes = int(declared)
+    except (TypeError, ValueError):
+        return None
+    limit = get_int("PROXY_SUSPECT_SCAN_MAX_KB", 64, minimum=1, maximum=1024) * 1024
+    if declared_bytes > limit:
+        return None
+
+    try:
+        body = await upstream_response.aread()
+    except httpx.HTTPError:
+        return None
+    if len(body) > limit:
+        return None
+
+    digest = hashlib.sha256(body).hexdigest()
+    host = urlparse(upstream_url).hostname or ""
+    threshold = get_int("PROXY_IDENTICAL_TILE_THRESHOLD", 12, minimum=2, maximum=200)
+    if get_detector().observe(host, upstream_url, digest, threshold=threshold):
+        response_headers["X-Tile-Suspect"] = "1"
+        response_headers["X-Tile-NoCache"] = "1"
+        logger.warning(
+            "相同字节瓦片：host=%s digest=%s size=%d url=%s（已标记 no-store）",
+            host,
+            digest[:16],
+            len(body),
+            upstream_url,
+        )
+    return body
 
 
 def _scheme_hint(error_text: str, raw_target: str) -> str:

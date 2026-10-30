@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.2.0 — 2026-10-30
+
+### 修复
+
+- **OSM 被「403 Access blocked」拦截**：出站请求一直以浏览器身份访问（`Chrome/126` UA +
+  `sec-ch-ua` + `Sec-Fetch-*`，且把终端用户的浏览器 UA 原样透传），违反 OSM 瓦片使用政策的两条
+  明文禁令 —— *"never impersonate another app or a browser"* 与 *"do not … tunnel all clients
+  behind a single, anonymous identity"*。表现为任意坐标返回同一张 256×256 提示图，HTTP 仍为 200。
+  现按 host 分流：命中 `IDENTIFIED_UA_BY_DOMAIN` 的上游改用带应用名与联系方式的稳定 UA
+  （`WebGIS-Dev/1.0 (+https://webgis.negiao.cn; contact: …)`），并剥掉 `sec-ch-ua*` /
+  `Sec-Fetch-*` / `Accept-Language`；客户端 `Referer` 仍然端到端保留（政策要求不得剥离）。
+
+### 新增
+
+- **相同字节瓦片检测**（`domains/tiles/infra/tile_fingerprint.py`）：同一 host 下若同一个
+  sha256 在窗口期内被 ≥ 阈值个**不同 URL** 命中，判定该 digest 为固定应答（拦截图/占位图/
+  水印图），响应加 `X-Tile-Suspect: 1` + `X-Tile-NoCache: 1`，`cache_policy` 据此改写为
+  `no-store` 并记 WARNING。此前这类响应会被打上 `s-maxage=604800`，**一次命中就在 CDN 边缘
+  钉住一周**，且 `X-Proxy-Status` 仍标 `SUCCESS`，排查时完全看不出来。
+  新增配置：`PROXY_IDENTICAL_TILE_DETECT` / `PROXY_IDENTICAL_TILE_THRESHOLD` /
+  `PROXY_SUSPECT_SCAN_MAX_KB`。
+- 仅对 `200 + image/* + 声明长度 ≤ 上限` 的响应生效（默认 64 KB），大图保持流式转发不变。
+
+### 已知局限
+
+- 远洋等纯色区域的瓦片渲染结果本就相同，可能被误判 —— 代价仅是这些瓦片不走长缓存。
+- 即使身份修复到位，OSM 政策第 5 节仍写明「generally do not recommend」自建缓存代理前置；
+  长期稳定方案是商业源或自托管瓦片。
+
 ## 1.1.0 — 2026-10-29
 
 ### 新增

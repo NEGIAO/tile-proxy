@@ -56,6 +56,33 @@ REFERER_BY_DOMAIN = {
     "bdimg.com": "https://map.baidu.com/",
 }
 
+# 需要以「应用自身身份」访问的上游（社区瓦片源的使用政策要求）。
+#
+# 背景（2026-10-30 实测）：OSM 对违反其瓦片使用政策的调用方返回固定的
+# 「403 Access blocked」提示图（HTTP 仍为 200）。政策原文明确禁止两条，
+# 而浏览器兼容头恰好同时踩中：
+#   - "never impersonate another app or a browser"；
+#   - "do not ... tunnel all clients behind a single, anonymous identity"。
+# 命中本表的 host 会：① UA 换成带应用名与联系方式的稳定串；
+# ② 剥掉 sec-ch-ua / Sec-Fetch-* 等浏览器专属头（非浏览器客户端带着它们
+# 反而坐实「伪装」，与自报身份自相矛盾）。
+# ⚠️ UA 必须稳定且可联系，不得随机化；站点域名或联系邮箱变更时同步更新。
+IDENTIFIED_UA_BY_DOMAIN = {
+    "tile.openstreetmap.org": (
+        "WebGIS-Dev/1.0 (+https://webgis.negiao.cn; contact: yaonaigao@gmail.com)"
+    ),
+}
+
+# 浏览器专属请求头：只在「以浏览器身份」访问时才合理；配合应用型 UA 时必须剥掉
+BROWSER_FINGERPRINT_HEADERS = (
+    "sec-ch-ua",
+    "sec-ch-ua-mobile",
+    "sec-ch-ua-platform",
+    "Sec-Fetch-Dest",
+    "Sec-Fetch-Mode",
+    "Sec-Fetch-Site",
+)
+
 # 出站请求的浏览器特征默认头（直通代理与纠偏代理共用，见 domains/tiles/），
 # 与真实浏览器请求对齐（Accept: */*、Accept-Encoding 含 br/zstd 等）。
 # ⚠️ br/zstd 版本仅可用于「流式原样转发、不解压」的面（直通代理 routes_passthrough）；
@@ -100,4 +127,20 @@ def referer_headers_for(url: str) -> dict[str, str] | None:
     for domain, referer in REFERER_BY_DOMAIN.items():
         if domain in url:
             return {"Referer": referer}
+    return None
+
+
+def identified_ua_for(url: str) -> str | None:
+    """按 host 白名单返回「应用身份」UA；非白名单源返回 None（沿用浏览器兼容 UA）。
+
+    Args:
+        url: 出站请求 URL。
+
+    Returns:
+        需要使用的应用型 User-Agent；命中时调用方还应剥掉 BROWSER_FINGERPRINT_HEADERS，
+        并保留客户端 Referer（社区源政策要求端到端不剥离 Referer）。
+    """
+    for domain, user_agent in IDENTIFIED_UA_BY_DOMAIN.items():
+        if domain in url:
+            return user_agent
     return None

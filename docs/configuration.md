@@ -34,6 +34,21 @@
 
 条目数 × 约 15KB ≈ 内存占用；10 万条可能到数 GB。
 
+## 相同字节瓦片检测
+
+用于识别「不同瓦片返回同一份字节」的异常响应 —— 典型是 OSM 的「403 Access blocked」
+拦截图：HTTP 200、`Content-Type: image/png`、体积恒定，任何按状态码/类型的健康检查
+都会放过它。判定命中后该响应回 `X-Tile-Suspect: 1` + `no-store`，并记 WARNING 日志。
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `PROXY_IDENTICAL_TILE_DETECT` | true | 检测总开关 |
+| `PROXY_IDENTICAL_TILE_THRESHOLD` | 12 | 同一 host 下同一指纹命中多少个不同 URL 即判定异常 |
+| `PROXY_SUSPECT_SCAN_MAX_KB` | 64 | 参与检测的响应体上限；超出走流式、不检测 |
+
+> 已知误判：大面积纯色区域（远洋、极地）渲染结果本就相同。代价仅是这些瓦片不走
+> 长缓存（每次回源），不影响正确性；嫌回源多就把阈值调高。
+
 ## 限流
 
 | 变量 | 默认 | 说明 |
