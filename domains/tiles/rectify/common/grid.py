@@ -20,7 +20,12 @@ from PIL import Image
 from config import get_int
 
 from domains.tiles.rectify.common.fetch import fetch_tile
-from domains.tiles.rectify.common.geo import TILE_SIZE, bytes_to_image, image_to_bytes
+from domains.tiles.rectify.common.geo import (
+    SUPPORTED_TILE_SIZES,
+    TILE_SIZE,
+    bytes_to_image,
+    image_to_bytes,
+)
 from domains.tiles.rectify.common.url_template import TileUrlTemplate, build_tile_url
 
 logger = logging.getLogger(__name__)
@@ -240,17 +245,23 @@ class SourceTileError(RuntimeError):
 _SOURCE_MIN_BYTES = 100
 
 
-def _validate_source_tile(data: bytes, url: str) -> None:
+def _validate_source_tile(
+    data: bytes, url: str, expected_size: Optional[int] = TILE_SIZE
+) -> int:
     """校验**单个源瓦片**能否用于合成（第一层判断，最关键的一层）。
 
     四张源片里只要有一张是坏的，拼出来的输出就会缺一块（透明条带），而且会被
     磁盘 / nginx / CDN 逐层放大。所以在**落盘之前**逐张把关：
 
     1. 非空、字节数不低于 `_SOURCE_MIN_BYTES`（错误页 / 截断响应）
-    2. 能解码、尺寸合理（`Image.verify()` 抓截断与损坏；宽高 >= 32）
+    2. 能解码、尺寸为 256×256 或 512×512（`Image.verify()` 抓截断与损坏）
     3. 不是「全透明空白片」——高德对无覆盖区返回的是**不透明白色/纯色**瓦片
        （2026-10-29 抽查 z3/z5/z10/z13/z17 五个海洋与边缘瓦片，alpha 全 255），
        所以全透明片只可能是上游抖动，不能当数据用。
+
+    ``expected_size`` 为 None 时只校验「属于支持的尺寸」，用于首次探测源片尺寸；
+    给出具体值（256/512）时要求整张网格严格一致，`_merge_tiles` 才能按网格
+    位置直接 paste 而不错位。返回实际边长供调用方决定输出尺寸。
 
     不合格抛 `SourceTileError`，由 `_fetch_tile_grid` 重试（重试会绕过缓存）。
     """
@@ -264,10 +275,17 @@ def _validate_source_tile(data: bytes, url: str) -> None:
             im.verify()
     except Exception as e:  # noqa: BLE001 - 任何解码失败都判不合格
         raise SourceTileError("无法解码（%r）：%s" % (e, url))
-    # 必须是 256×256：`_merge_tiles` 是按网格位置直接 paste 的，尺寸不符会静默错位
-    if (w, h) != (TILE_SIZE, TILE_SIZE):
+    # 高德 `scl=2` 等高清模板返回 512×512，覆盖的地理范围与 256 瓦片相同，
+    # TileSize 只影响像素密度；两种尺寸都要能纠偏。非正方形/非支持尺寸一律拒绝。
+    if w != h or w not in SUPPORTED_TILE_SIZES:
         raise SourceTileError(
-            "尺寸异常 %dx%d（应为 %dx%d）：%s" % (w, h, TILE_SIZE, TILE_SIZE, url)
+            "尺寸异常 %dx%d（仅支持 %s）：%s"
+            % (w, h, "/".join("%d" % s for s in SUPPORTED_TILE_SIZES), url)
+        )
+    if expected_size is not None and w != expected_size:
+        raise SourceTileError(
+            "尺寸不一致 %dx%d（本网格要求 %dx%d）：%s"
+            % (w, h, expected_size, expected_size, url)
         )
     # 全透明判据直接看 alpha——不能用 is_blank_tile_bytes 的 2KB 体积预筛：
     # 带元数据的空白 PNG 会超过 2KB 而漏检。
@@ -280,6 +298,7 @@ def _validate_source_tile(data: bytes, url: str) -> None:
         raise
     except Exception as e:  # noqa: BLE001
         raise SourceTileError("无法解码（%r）：%s" % (e, url))
+    return w
 
 
 # 同一源片的并发请求只打一次上游（单飞）。瓦片是连续的：一屏几十张输出瓦片
@@ -320,11 +339,15 @@ async def _get_tile_cached(
     *,
     client: Optional[httpx.AsyncClient],
     force_refresh: bool = False,
+    tile_size: Optional[int] = TILE_SIZE,
 ) -> bytes:
     """取单个源瓦片：缓存 → 单飞 → 拉取 → **第一层校验** → 落盘。
 
     缓存命中直接返回文件字节，省掉解码/编码；`force_refresh=True` 时跳过缓存
     （用于输出被判废后的强制重取）。同一源片的并发请求走同一把锁，只打一次上游。
+
+    ``tile_size=None`` 用于首次探测（256/512 都接受）；其余场景必须传入网格
+    约定的边长，保证同一张合成图里的源片尺寸一致。
     """
     tile_path = _tile_cache_path(cache_dir, template, category, z, x, y)
 
@@ -352,7 +375,7 @@ async def _get_tile_cached(
         # P1-4 S2：先判字节上限，再进入解码/落盘（拒绝路径不写缓存）
         _reject_oversized_tile_bytes(tile_bytes, url)
         # ★ 第一层判断：源片本身必须可用，坏片绝不进合成图、也绝不落盘
-        _validate_source_tile(tile_bytes, url)
+        _validate_source_tile(tile_bytes, url, tile_size)
 
         try:
             if _is_valid_image_bytes(tile_bytes):
@@ -366,6 +389,34 @@ async def _get_tile_cached(
         except Exception as e:
             logger.error("Unexpected error during tile validation: %s", e, exc_info=True)
         return tile_bytes
+
+
+async def probe_source_tile(
+    x: int,
+    y: int,
+    z: int,
+    template: TileUrlTemplate,
+    cache_dir: Path,
+    category: str,
+    *,
+    client: Optional[httpx.AsyncClient],
+) -> Tuple[bytes, int]:
+    """取一张源片并探测其边长（256 或 512），供后续整张网格统一使用。
+
+    高德 `scl=2` 模板返回 512×512，覆盖的地理范围与 256 瓦片相同；纠偏的
+    网格定位、QUAD 画布都必须按实际边长取值。这里用 ``tile_size=None``
+    走「两种尺寸都接受」的校验，探测结果同时作为 z≤9 直通的输出字节，
+    不会多打一次上游（后续网格复用同一份磁盘缓存）。
+    """
+    data = await _get_tile_cached(
+        x, y, z, template, cache_dir, category,
+        client=client, tile_size=None,
+    )
+    with Image.open(BytesIO(data)) as im:
+        size = im.size
+    if size[0] != size[1] or size[0] not in SUPPORTED_TILE_SIZES:
+        raise SourceTileError("源瓦片尺寸不受支持：%sx%s" % size)
+    return data, size[0]
 
 
 def _is_valid_image_bytes(data: bytes) -> bool:
@@ -402,6 +453,7 @@ async def _fetch_tile_grid(
     category: str,
     client: Optional[httpx.AsyncClient],
     force_refresh: bool = False,
+    tile_size: int = TILE_SIZE,
 ) -> List[bytes]:
     """并发获取瓦片网格（受全局信号量 `MAX_CONCURRENCY` 限流）
 
@@ -409,9 +461,11 @@ async def _fetch_tile_grid(
     把上游打爆。限流错误仍由 fetch.py 的重试机制处理（RemoteProtocolError）。
 
     **两层判断里的第一层就在这条路径上**：每张源片先过 `_validate_source_tile`
-    （空响应/过小/无法解码/全透明），不合格立刻抛错；这里重试 `_FETCH_ATTEMPTS`
-    次（重试绕过缓存），仍失败就整块抛错 → 路由返回 5xx（各层都不缓存），
-    绝不拿坏片去合成（那会产出被缓存 7 天的透明条带）。
+    （空响应/过小/无法解码/全透明/尺寸不符），不合格立刻抛错；这里重试
+    `_FETCH_ATTEMPTS` 次（重试绕过缓存），仍失败就整块抛错 → 路由返回 5xx
+    （各层都不缓存），绝不拿坏片去合成（那会产出被缓存 7 天的透明条带）。
+
+    ``tile_size`` 为 256 或 512；整张网格必须统一，像素数护栏按实际边长折算。
     """
     semaphore = _get_fetch_semaphore()
 
@@ -426,6 +480,7 @@ async def _fetch_tile_grid(
                         x, y, z, template, cache_dir, category,
                         client=client,
                         force_refresh=force_refresh or attempt > 0,
+                        tile_size=tile_size,
                     )
                 except Exception as e:  # noqa: BLE001 - 重试用尽后统一抛出
                     last_exc = e
@@ -446,11 +501,16 @@ async def _fetch_tile_grid(
     y_count = y_max - y_min + 1
     total_tiles = x_count * y_count
 
-    # P1-4 S2：网格瓦片数上限——合成图为 (x_count*256)×(y_count*256)，
-    # 无上限时内存占用随请求间接放大（正常纠偏为 2×2~3×3，默认 64 留足余量）
-    if _MAX_TILES_PER_REQUEST > 0 and total_tiles > _MAX_TILES_PER_REQUEST:
+    # P1-4 S2：网格瓦片数上限——合成图为 (x_count*tile_size)×(y_count*tile_size)，
+    # 无上限时内存占用随请求间接放大（正常纠偏为 2×2~3×3，默认 64 留足余量）。
+    # 512 源单瓦片像素是 256 的 4 倍，按面积折算上限，防 256MB 容器被撑爆。
+    max_tiles = _MAX_TILES_PER_REQUEST
+    if max_tiles > 0 and tile_size > TILE_SIZE:
+        max_tiles = max(4, max_tiles * (TILE_SIZE // tile_size) ** 2)
+    if max_tiles > 0 and total_tiles > max_tiles:
         raise ValueError(
-            f"纠偏网格过大：{x_count}x{y_count}={total_tiles} 片 > 上限 {_MAX_TILES_PER_REQUEST} 片"
+            f"纠偏网格过大：{x_count}x{y_count}={total_tiles} 片 > 上限 {max_tiles} 片"
+            f"（tile_size={tile_size}）"
         )
 
     if total_tiles > 9:
@@ -472,20 +532,21 @@ def _merge_tiles(
     x_max: int,
     y_min: int,
     y_max: int,
+    tile_size: int = TILE_SIZE,
 ) -> Image.Image:
     """拼接标准 XYZ 网格瓦片（Y 轴向下，行序与索引升序一致）。"""
     composite = Image.new(
         "RGBA",
-        ((x_max - x_min + 1) * TILE_SIZE, (y_max - y_min + 1) * TILE_SIZE),
+        ((x_max - x_min + 1) * tile_size, (y_max - y_min + 1) * tile_size),
     )
     tile_index = 0
     for i, _ in enumerate(range(x_min, x_max + 1)):
         for j, _ in enumerate(range(y_min, y_max + 1)):
             with Image.open(BytesIO(tiles[tile_index])) as tile:
-                if tile.size != (TILE_SIZE, TILE_SIZE):
+                if tile.size != (tile_size, tile_size):
                     raise ValueError(
-                        "源瓦片尺寸 %s != %dx%d，拼接会错位" % (tile.size, TILE_SIZE, TILE_SIZE)
+                        "源瓦片尺寸 %s != %dx%d，拼接会错位" % (tile.size, tile_size, tile_size)
                     )
-                composite.paste(tile.convert("RGBA"), (i * TILE_SIZE, j * TILE_SIZE))
+                composite.paste(tile.convert("RGBA"), (i * tile_size, j * tile_size))
             tile_index += 1
     return composite

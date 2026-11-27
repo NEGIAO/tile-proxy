@@ -27,11 +27,11 @@ from domains.tiles.rectify.common.geo import (
 )
 from domains.tiles.rectify.common.grid import (
     _fetch_tile_grid,
-    _get_tile_cached,
     _merge_tiles,
     _tile_cache_path,
     assess_tile_quality,
     load_output_cache,
+    probe_source_tile,
     save_output_cache,
     transparent_pct,
 )
@@ -54,6 +54,7 @@ async def _build_rectified_tile(
     source_category: str,
     client: Optional[httpx.AsyncClient],
     force_refresh: bool = False,
+    tile_size: int = TILE_SIZE,
 ) -> Tuple[bytes, int, int, float]:
     """由源坐标系下的精确四角构造纠偏瓦片（QUAD 重采样，几何无缝）。
 
@@ -66,23 +67,24 @@ async def _build_rectified_tile(
         source_corners: ((lt_lon, lt_lat), (rt_lon, rt_lat),
             (lb_lon, lb_lat), (rb_lon, rb_lat)) 源坐标系四角经纬度
         force_refresh: 跳过源瓦片缓存强制重取（输出被判废时用）
+        tile_size: 源瓦片边长（256 或 512）；输出与之同尺寸
 
     Returns:
         (输出瓦片字节, 源网格瓦片字节总数, 源网格像素总数, 源网格透明像素占比)
         ——后三者供调用方做有效性校验（体积比对 + 「不透明输入不该产出透明输出」）。
     """
     (lt_lon, lt_lat), (rt_lon, rt_lat), (lb_lon, lb_lat), (rb_lon, rb_lat) = source_corners
-    px_lt = lonlat_to_global_px(lt_lon, lt_lat, z)
-    px_rt = lonlat_to_global_px(rt_lon, rt_lat, z)
-    px_lb = lonlat_to_global_px(lb_lon, lb_lat, z)
-    px_rb = lonlat_to_global_px(rb_lon, rb_lat, z)
+    px_lt = lonlat_to_global_px(lt_lon, lt_lat, z, tile_size)
+    px_rt = lonlat_to_global_px(rt_lon, rt_lat, z, tile_size)
+    px_lb = lonlat_to_global_px(lb_lon, lb_lat, z, tile_size)
+    px_rb = lonlat_to_global_px(rb_lon, rb_lat, z, tile_size)
     all_px = (px_lt[0], px_rt[0], px_lb[0], px_rb[0])
     all_py = (px_lt[1], px_rt[1], px_lb[1], px_rb[1])
     limit = 2**z - 1
-    x_min = max(0, min(math.floor(min(all_px) / TILE_SIZE), limit))
-    x_max = max(0, min(math.floor(max(all_px) / TILE_SIZE), limit))
-    y_min = max(0, min(math.floor(min(all_py) / TILE_SIZE), limit))
-    y_max = max(0, min(math.floor(max(all_py) / TILE_SIZE), limit))
+    x_min = max(0, min(math.floor(min(all_px) / tile_size), limit))
+    x_max = max(0, min(math.floor(max(all_px) / tile_size), limit))
+    y_min = max(0, min(math.floor(min(all_py) / tile_size), limit))
+    y_max = max(0, min(math.floor(max(all_py) / tile_size), limit))
 
     tiles = await _fetch_tile_grid(
         x_min,
@@ -95,13 +97,14 @@ async def _build_rectified_tile(
         source_category,
         client,
         force_refresh,
+        tile_size=tile_size,
     )
     source_bytes_total = sum(len(t) for t in tiles)
-    source_pixels = len(tiles) * TILE_SIZE * TILE_SIZE
-    composite = _merge_tiles(tiles, x_min, x_max, y_min, y_max)
+    source_pixels = len(tiles) * tile_size * tile_size
+    composite = _merge_tiles(tiles, x_min, x_max, y_min, y_max, tile_size)
 
     def _to_composite(px: float, py: float) -> Tuple[float, float]:
-        return (px - x_min * TILE_SIZE, py - y_min * TILE_SIZE)
+        return (px - x_min * tile_size, py - y_min * tile_size)
 
     quad = (
         _to_composite(*px_lt),  # NW
@@ -113,7 +116,7 @@ async def _build_rectified_tile(
     # assess_tile_quality 做「多出来的透明」判据，能抓住"某片被空白顶替"却
     # 没过 10% 阈值的情况（线上 12.9% 与 3.5% 两种条带都是这样漏的）。
     src_trans = transparent_pct(composite)
-    warped = _quad_warp(composite, quad, _GCJ_RESAMPLE)
+    warped = _quad_warp(composite, quad, _GCJ_RESAMPLE, tile_size)
     return image_to_bytes(warped), source_bytes_total, source_pixels, src_trans
 
 
@@ -127,6 +130,7 @@ async def _build_with_quality(
     client: Optional[httpx.AsyncClient],
     x: int,
     y: int,
+    tile_size: int = TILE_SIZE,
 ) -> Tuple[bytes, bool]:
     """构建纠偏瓦片并做有效性校验，不合格则强制重取一次。
 
@@ -136,7 +140,7 @@ async def _build_with_quality(
     打 `no-store` + `X-Tile-Blank: 1`，不落盘、不进缓存。
     """
     tile_bytes, src_total, src_px, src_trans = await _build_rectified_tile(
-        corners, z, template, cache_dir, category, client
+        corners, z, template, cache_dir, category, client, tile_size=tile_size
     )
     ok, why = assess_tile_quality(
         tile_bytes, source_bytes_total=src_total, source_pixels=src_px,
@@ -147,7 +151,8 @@ async def _build_with_quality(
 
     logger.warning("%s 输出不合格(%s)，强制重取：z=%d x=%d y=%d", label, why, z, x, y)
     tile_bytes, src_total, src_px, src_trans = await _build_rectified_tile(
-        corners, z, template, cache_dir, category, client, force_refresh=True
+        corners, z, template, cache_dir, category, client,
+        force_refresh=True, tile_size=tile_size,
     )
     ok, why = assess_tile_quality(
         tile_bytes, source_bytes_total=src_total, source_pixels=src_px,
@@ -182,19 +187,24 @@ async def get_gcj2wgs_tile(
     if cached is not None:
         return cached, True
 
+    # 探测源片尺寸：高德 `scl=2` 高清模板返回 512×512，与 256 瓦片同一
+    # z/x/y 网格，只是像素密度翻倍。整条纠偏链路按实际尺寸走，输出同尺寸。
+    # 这次取片会落盘，后续网格直接命中缓存，不会重复打上游。
+    probe_bytes, tile_size = await probe_source_tile(
+        x, y, z, template, cache_dir, "source-gcj", client=client
+    )
+
     # 低缩放级别：偏差可忽略，直接返回源瓦片（源片已过第一层校验）
     if z <= 9:
-        tile_bytes = await _get_tile_cached(
-            x, y, z, template, cache_dir, "source-gcj", client=client
-        )
-        save_output_cache(output_path, tile_bytes)
-        return tile_bytes, True
+        save_output_cache(output_path, probe_bytes)
+        return probe_bytes, True
 
     # 高缩放级别：执行像素级纠偏（四角逐点转换，勿取极值压扁）
     wgs_bbox = xyz_to_bbox(x, y, z)
     gcj_corners = wgsbbox_to_gcj_corners(wgs_bbox)
     tile_bytes, ok = await _build_with_quality(
-        "gcj2wgs", gcj_corners, z, template, cache_dir, "source-gcj", client, x, y
+        "gcj2wgs", gcj_corners, z, template, cache_dir, "source-gcj", client,
+        x, y, tile_size,
     )
     if ok:
         save_output_cache(output_path, tile_bytes)
@@ -224,19 +234,22 @@ async def get_wgs2gcj_tile(
     if cached is not None:
         return cached, True
 
+    # 探测源片尺寸（256/512），输出与源同尺寸；见 get_gcj2wgs_tile 说明
+    probe_bytes, tile_size = await probe_source_tile(
+        x, y, z, template, cache_dir, "source-wgs", client=client
+    )
+
     # 低缩放级别：偏差可忽略，直接返回源瓦片（源片已过第一层校验）
     if z <= 9:
-        tile_bytes = await _get_tile_cached(
-            x, y, z, template, cache_dir, "source-wgs", client=client
-        )
-        save_output_cache(output_path, tile_bytes)
-        return tile_bytes, True
+        save_output_cache(output_path, probe_bytes)
+        return probe_bytes, True
 
     # 高缩放级别：执行像素级纠偏（四角逐点转换，勿取极值压扁）
     gcj_bbox = xyz_to_bbox(x, y, z)
     wgs_corners = gcjbbox_to_wgs_corners(gcj_bbox)
     tile_bytes, ok = await _build_with_quality(
-        "wgs2gcj", wgs_corners, z, template, cache_dir, "source-wgs", client, x, y
+        "wgs2gcj", wgs_corners, z, template, cache_dir, "source-wgs", client,
+        x, y, tile_size,
     )
     if ok:
         save_output_cache(output_path, tile_bytes)

@@ -1,7 +1,7 @@
 # tile-proxy
 
 [![在线演示](https://img.shields.io/badge/demo-online-brightgreen)](https://vpn.negiao.cn/tile-proxy/)
-[![版本](https://img.shields.io/badge/version-1.1.0-blue)](CHANGELOG.md)
+[![版本](https://img.shields.io/badge/version-1.2.1-blue)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-GPL--2.0--or--later-green)](LICENSE)
 [![Docker](https://img.shields.io/badge/docker-negiao%2Ftile--proxy-2496ED)](https://hub.docker.com/r/negiao/tile-proxy)
 
@@ -10,7 +10,7 @@
 </h3>
 
 <p align="center">
-打开就是联调页，六个底图示例一键切换，不用装任何东西。<br>
+打开就是联调页，七个底图示例一键切换，不用装任何东西。<br>
 演示站限流较紧（每 IP 每分钟 400 次，够看效果、不够批量抓），长期使用请自己部署。
 </p>
 
@@ -42,14 +42,20 @@
 docker run -d --name tile-proxy -p 127.0.0.1:9002:9002 \
   -v tile-proxy-cache:/data/cache \
   -v tile-proxy-admin:/data/admin \
-  negiao/tile-proxy:1.1.0
+  negiao/tile-proxy:1.2.1
 curl http://127.0.0.1:9002/health
 ```
 
-镜像 [`negiao/tile-proxy`](https://hub.docker.com/r/negiao/tile-proxy)，标签 `latest` / `1.1.0` / `1.0.0`，
-自带 `HEALTHCHECK`（`docker ps` 会显示 `healthy`）。镜像里已含管理控制台、内置联调页与纠偏依赖，
-起来就能用，不需要装 Python 或改任何配置。仓库里的 `docker-compose.yml` 默认也是拉镜像，
-所以 clone 下来直接 `docker compose up -d` 就行，不需要本地 build。
+镜像 [`negiao/tile-proxy`](https://hub.docker.com/r/negiao/tile-proxy)，当前版本标签 `latest` / `1.2.1`
+（历史标签见 Docker Hub 页面）。自带 `HEALTHCHECK`（`docker ps` 会显示 `healthy`），镜像里已含管理控制台、
+内置联调页与纠偏依赖，起来就能用，不需要装 Python 或改任何配置。仓库里的 `docker-compose.yml`
+默认也是拉镜像，所以 clone 下来直接 `docker compose up -d` 就行，不需要本地 build。
+
+已用 compose 部署的升级到最新版：
+
+```bash
+docker compose pull && docker compose up -d
+```
 
 两个具名卷：`/data/cache` 存纠偏磁盘缓存，`/data/admin` 存管理配置（口令哈希 + 31 项运行时配置）。
 **删 `tile-proxy-admin` 等于重置管理口令。**
@@ -65,7 +71,8 @@ uvicorn app:app --host 127.0.0.1 --port 9002
 
 想自己构建镜像：把 `docker-compose.yml` 里的 `image:` 换成 `build: .`，再 `docker compose up -d --build`。
 
-打开 `http://127.0.0.1:9002/` 即内置联调页，切到「高德 gcj2wgs」就能看到纠偏前后差异。
+打开 `http://127.0.0.1:9002/` 即内置联调页，切到「高德 gcj2wgs」就能看到纠偏前后差异；
+「高德 512 无注记」是 `style=8&ltype=1&scl=2` 的干净道路底图，走同一套纠偏链路。
 
 生产部署（nginx 反代、systemd、升级、安全清单）→ [docs/deployment.md](docs/deployment.md)
 
@@ -77,10 +84,18 @@ uvicorn app:app --host 127.0.0.1 --port 9002
 http://127.0.0.1:9002/proxy/gcj2wgs/http://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}
 ```
 
+高德 `scl=2`（512×512 高分屏）模板同样支持：代理按源片尺寸输出同尺寸瓦片，无需去掉该参数。
+
 ```js
 // OpenLayers：此时 GPS / GeoJSON / OSM 叠加层的坐标不用做任何转换
 new ol.layer.Tile({
   source: new ol.source.XYZ({ url: "<上面那条 URL>" }),
+});
+
+// 若 URL 带 scl=2（512 瓦片），前端必须同步用 512 网格，否则高清细节会被缩放丢弃：
+new ol.source.XYZ({
+  url: "<带 scl=2 的 URL>",
+  tileGrid: ol.tilegrid.createXYZ({ tileSize: [512, 512], maxZoom: 22 }),
 });
 ```
 

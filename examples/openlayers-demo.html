@@ -105,6 +105,7 @@
       <span class="grp">高德</span>
       <button id="btnAmapRaw" class="raw">原始</button>
       <button id="btnAmap">gcj2wgs</button>
+      <button id="btnAmap512">512 无注记</button>
       <span class="grp">百度</span>
       <button id="btnBaiduRaw" class="raw">原始</button>
       <button id="btnBaidu">bd2wgs</button>
@@ -155,9 +156,12 @@
     const HOME = [116.3905, 39.9147];
 
     const AMAP_TILE = "https://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}";
+    // style=8 为干净道路底图，ltype=1 去掉文字/POI 注记，scl=2 返回 512×512 高清瓦片。
+    // 代理会探测源片边长并按 512 输出，前端也要用 512 的 tileGrid（见 makeSource）。
+    const AMAP_TILE_512 = "https://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&ltype=1&scl=2&x={x}&y={y}&z={z}";
     const BAIDU_TILE = "https://maponline0.bdimg.com/tile/?qt=vtile&x={x}&y={y}&z={z}&styles=pl&scaler=1&udt=20240101";
 
-    // 六个示例：url 就是「点一下即可复制」的完整 XYZ 模板
+    // 七个示例：url 就是「点一下即可复制」的完整 XYZ 模板
     const MODES = {
       osm: {
         label: "当前图层：OSM 标准街道图（经本服务代理——浏览器直连常被 DNS 污染或被 OSM 限流，返回 403）",
@@ -178,6 +182,11 @@
         label: "当前图层：高德电子图 gcj2wgs 纠偏后——路网与白模应严丝合缝",
         url: BASE + "/proxy/gcj2wgs/" + AMAP_TILE,
         attr: "© 高德地图 · gcj2wgs 纠偏",
+      },
+      amap512: {
+        label: "当前图层：高德 512 无注记底图（style=8&ltype=1&scl=2）gcj2wgs 纠偏后——干净道路网，无文字/POI 标注",
+        url: BASE + "/proxy/gcj2wgs/" + AMAP_TILE_512,
+        attr: "© 高德地图 · gcj2wgs 纠偏 · 512 高清",
       },
       baiduRaw: {
         label: "当前图层：百度地图「原始」——直连上游、不经代理；百度非标准网格（原点居中、Y 轴向上、res=2^(18-z)），页面已按百度 tileGrid 适配加载，白模偏移最大",
@@ -202,6 +211,7 @@
       google: document.getElementById("btnGoogle"),
       amapRaw: document.getElementById("btnAmapRaw"),
       amap: document.getElementById("btnAmap"),
+      amap512: document.getElementById("btnAmap512"),
       baiduRaw: document.getElementById("btnBaiduRaw"),
       baidu: document.getElementById("btnBaidu"),
     };
@@ -317,10 +327,16 @@
     }
 
     // 唯一底图源：OSM 用内置 source（自带 attribution），百度走网格适配，
-    // 其余一律标准 XYZ 模板
+    // 其余一律标准 XYZ 模板。`scl=2` 的高德高清模板一张瓦片覆盖同样的 x/y/z
+    // 范围但像素为 512×512，必须用 512 的 tileGrid，否则 OL 会把 512 图
+    // 塞进 256 槽位缩放，白白丢掉高清细节。
     function makeSource(url, attribution) {
       if (url === MODES.baiduRaw.url) return baiduSource(attribution);
-      return new ol.source.XYZ({ url: url, attributions: attribution || "" });
+      const opts = { url: url, attributions: attribution || "" };
+      if (/(?:[?&])scl=2(?:&|$)/i.test(url)) {
+        opts.tileGrid = ol.tilegrid.createXYZ({ tileSize: [512, 512], maxZoom: 22 });
+      }
+      return new ol.source.XYZ(opts);
     }
 
     // 点示例 / 改 URL → 直接替换唯一底图的 source（输入框即当前底图 URL）

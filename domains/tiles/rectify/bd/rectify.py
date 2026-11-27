@@ -33,6 +33,7 @@ from domains.tiles.rectify.common.grid import (
     _tile_cache_path,
     assess_tile_quality,
     load_output_cache,
+    probe_source_tile,
     save_output_cache,
     transparent_pct,
 )
@@ -267,15 +268,13 @@ async def get_wgs2bd_tile(
     z_src = max(z - 1, _STD_MIN_ZOOM)
     n = 2 ** z_src
 
-    # 3. 精确四角 → 标准 XYZ 全局像素（Y 轴向下，共用 helper，
-    #    与 lonlat_to_xyz 同公式但保留浮点）；网格范围由其极值确定
-    def _std_px(lon: float, lat: float) -> Tuple[float, float]:
-        return lonlat_to_global_px(lon, lat, z_src)
-
-    px_lt = _std_px(*wgs_lt)
-    px_rt = _std_px(*wgs_rt)
-    px_lb = _std_px(*wgs_lb)
-    px_rb = _std_px(*wgs_rb)
+    # 3. 先用默认 256 口径算出源网格覆盖范围，挑一张源片探测实际边长。
+    #    512 源（如高德 scl=2）的全局像素正好是 256 口径的 2 倍，除以 512
+    #    后索引不变，因此用 256 口径挑出的探测片在 512 网格里同样有效。
+    px_lt = lonlat_to_global_px(*wgs_lt, z_src)
+    px_rt = lonlat_to_global_px(*wgs_rt, z_src)
+    px_lb = lonlat_to_global_px(*wgs_lb, z_src)
+    px_rb = lonlat_to_global_px(*wgs_rb, z_src)
     all_px = (px_lt[0], px_rt[0], px_lb[0], px_rb[0])
     all_py = (px_lt[1], px_rt[1], px_lb[1], px_rb[1])
     limit = n - 1
@@ -283,10 +282,28 @@ async def get_wgs2bd_tile(
     tx_max = max(0, min(math.floor(max(all_px) / TILE_SIZE), limit))
     ty_min = max(0, min(math.floor(min(all_py) / TILE_SIZE), limit))
     ty_max = max(0, min(math.floor(max(all_py) / TILE_SIZE), limit))
+    _probe_bytes, tile_size = await probe_source_tile(
+        tx_min, ty_min, z_src, template, cache_dir, "source-wgs", client=client
+    )
+
+    # 按实际边长重算精确四角与网格范围（索引理论上不变，避免浮点边界差异）
+    def _std_px(lon: float, lat: float) -> Tuple[float, float]:
+        return lonlat_to_global_px(lon, lat, z_src, tile_size)
+
+    px_lt = _std_px(*wgs_lt)
+    px_rt = _std_px(*wgs_rt)
+    px_lb = _std_px(*wgs_lb)
+    px_rb = _std_px(*wgs_rb)
+    all_px = (px_lt[0], px_rt[0], px_lb[0], px_rb[0])
+    all_py = (px_lt[1], px_rt[1], px_lb[1], px_rb[1])
+    tx_min = max(0, min(math.floor(min(all_px) / tile_size), limit))
+    tx_max = max(0, min(math.floor(max(all_px) / tile_size), limit))
+    ty_min = max(0, min(math.floor(min(all_py) / tile_size), limit))
+    ty_max = max(0, min(math.floor(max(all_py) / tile_size), limit))
 
     # 4/5. 拉取源网格 → 拼接 → QUAD 重采样（标准 XYZ 像素方向与合成图一致，无需翻转）
     def _to_composite(px: float, py: float) -> Tuple[float, float]:
-        return (px - tx_min * TILE_SIZE, py - ty_min * TILE_SIZE)
+        return (px - tx_min * tile_size, py - ty_min * tile_size)
 
     quad = (
         _to_composite(*px_lt),  # NW
@@ -299,14 +316,14 @@ async def get_wgs2bd_tile(
     for attempt in (0, 1):
         tiles = await _fetch_tile_grid(
             tx_min, tx_max, ty_min, ty_max, z_src, template, cache_dir, "source-wgs",
-            client, force_refresh=bool(attempt),
+            client, force_refresh=bool(attempt), tile_size=tile_size,
         )
-        composite = _merge_tiles(tiles, tx_min, tx_max, ty_min, ty_max)
-        data = image_to_bytes(_quad_warp(composite, quad, _BD_RESAMPLE))
+        composite = _merge_tiles(tiles, tx_min, tx_max, ty_min, ty_max, tile_size)
+        data = image_to_bytes(_quad_warp(composite, quad, _BD_RESAMPLE, tile_size))
         ok, why = assess_tile_quality(
             data,
             source_bytes_total=sum(len(t) for t in tiles),
-            source_pixels=len(tiles) * TILE_SIZE * TILE_SIZE,
+            source_pixels=len(tiles) * tile_size * tile_size,
             source_transparent_pct=transparent_pct(composite),
         )
         if ok:

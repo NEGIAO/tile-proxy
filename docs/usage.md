@@ -155,6 +155,9 @@ https://vpn.negiao.cn/proxy/gcj2wgs/http://webrd01.is.autonavi.com/appmaptile?la
 http://127.0.0.1:9002/proxy/gcj2wgs/http://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}
 ```
 
+> `scl=2` 高清模板（512×512）也可直接使用：代理会探测源片边长，输出同尺寸的纠偏瓦片，
+> 不需要为了适配代理而删掉这个参数。
+
 OpenLayers 完整片段：
 
 ```js

@@ -24,8 +24,9 @@ def _quad_warp(
         Tuple[float, float],
     ],
     resample: int,
+    tile_size: int = TILE_SIZE,
 ) -> Image.Image:
-    """按精确四角四边形从合成图重采样到 256×256 输出瓦片（QUAD 透视变换）。
+    """按精确四角四边形从合成图重采样到 ``tile_size`` 输出瓦片（QUAD 透视变换）。
 
     相邻瓦片的共享边端点由同一地理角点经同一函数算出，bit 级一致，
     几何上严格无缝（根因分析见 Docs/TODO/backend-reorg-plan.md）。
@@ -38,16 +39,19 @@ def _quad_warp(
     Args:
         composite: 源网格合成图
         quad: (NW, SW, SE, NE) 合成图像素坐标（float，PIL QUAD 语义：
-            输出 (0,0)/(0,256)/(256,256)/(256,0) 依次映射到这四点）
+            输出 (0,0)/(0,tile_size)/(tile_size,tile_size)/(tile_size,0)
+            依次映射到这四点）
         resample: PIL 重采样核（gcj 传 BILINEAR，bd 传 BICUBIC）
+        tile_size: 输出瓦片边长，必须与源瓦片边长一致（256 或 512）
 
     Returns:
-        256×256 RGBA 输出瓦片；四边形退化/整体落在合成图外时返回透明瓦片
+        ``tile_size``×``tile_size`` RGBA 输出瓦片；四边形退化/整体落在
+        合成图外时返回同尺寸透明瓦片
     """
     (nw_x, nw_y), (sw_x, sw_y), (se_x, se_y), (ne_x, ne_y) = quad
     for v in (nw_x, nw_y, sw_x, sw_y, se_x, se_y, ne_x, ne_y):
         if not math.isfinite(v):
-            return Image.new("RGBA", (TILE_SIZE, TILE_SIZE))
+            return Image.new("RGBA", (tile_size, tile_size))
     if (
         math.hypot(se_x - sw_x, se_y - sw_y) < 0.5
         or math.hypot(ne_x - nw_x, ne_y - nw_y) < 0.5
@@ -65,7 +69,7 @@ def _quad_warp(
     ):
         return Image.new("RGBA", (TILE_SIZE, TILE_SIZE))
     return composite.transform(
-        (TILE_SIZE, TILE_SIZE),
+        (tile_size, tile_size),
         Image.QUAD,
         (nw_x, nw_y, sw_x, sw_y, se_x, se_y, ne_x, ne_y),
         resample=resample,

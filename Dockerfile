@@ -1,10 +1,9 @@
-# syntax=docker/dockerfile:1
 FROM python:3.12-slim
 
 # OCI 元数据（版本随 pyproject.toml / app.py / CHANGELOG 同步）
 LABEL org.opencontainers.image.title="tile-proxy" \
       org.opencontainers.image.description="Map tile passthrough proxy and GCJ-02/BD-09 rectification (FastAPI)" \
-      org.opencontainers.image.version="1.1.0" \
+      org.opencontainers.image.version="1.2.1" \
       org.opencontainers.image.licenses="GPL-2.0-or-later" \
       org.opencontainers.image.source="https://github.com/NEGIAO/tile-proxy"
 

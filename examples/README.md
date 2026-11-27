@@ -2,7 +2,7 @@
 
 | 文件 | 说明 |
 |---|---|
-| `openlayers-demo.html` | 服务内置首页（`GET /`）。六个示例（OSM / Google 影像 / 高德·百度「原始」直连 / 高德 gcj2wgs / 百度 bd2wgs）点一下就把该图层**实际加载的 XYZ 模板 URL** 填进输入框，可手改后回车加载，也可直接复制到 OL / Leaflet / Cesium |
+| `openlayers-demo.html` | 服务内置首页（`GET /`）。七个示例（OSM / Google 影像 / 高德·百度「原始」直连 / 高德 gcj2wgs / 高德 512 无注记 gcj2wgs / 百度 bd2wgs）点一下就把该图层**实际加载的 XYZ 模板 URL** 填进输入框，可手改后回车加载，也可直接复制到 OL / Leaflet / Cesium。含 `scl=2` 的模板会自动用 512 tileGrid 加载 |
 | `data/forbidden-city-buildings.geojson` | 故宫建筑白模（3896 个面，WGS84），首页自动加载作对照层；由 `GET /demo/data/{name}` 提供 |
 
 该页由 `app.py` 的 `/` 路由返回，容器镜像里也会带（`Dockerfile: COPY examples ./examples`），

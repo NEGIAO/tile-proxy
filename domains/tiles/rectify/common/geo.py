@@ -12,6 +12,10 @@ from config import get_str
 from .transform import gcj2wgs, wgs2gcj
 
 TILE_SIZE = 256
+# 源瓦片支持的像素边长。高德 `scl=2` / `@2x` 等高清模板返回 512×512，
+# 与 256 瓦片覆盖同一地理范围，只是像素密度翻倍；纠偏网格按同一 z/x/y
+# 索引工作，只是每条边的像素数随 tile_size 变化。
+SUPPORTED_TILE_SIZES = (256, 512)
 
 
 def _find_backend_root() -> Path:
@@ -77,18 +81,23 @@ def lonlat_to_xyz(lon: float, lat: float, z: int) -> Tuple[int, int]:
     return _clamp_xy(int(x), int(y), z)
 
 
-def lonlat_to_global_px(lon: float, lat: float, z: int) -> Tuple[float, float]:
+def lonlat_to_global_px(
+    lon: float, lat: float, z: int, tile_size: int = TILE_SIZE
+) -> Tuple[float, float]:
     """经纬度 → 该层级全局像素坐标（float，不取整不钳制）。
 
     与 :func:`lonlat_to_xyz` 同一公式（标准 slippy 约定：x 向东、y 向南），
     但保留浮点亚像素部分，供 QUAD 精确重采样用。调用方按需自行处理
     网格覆盖范围（floor 取极值）与越界钳制。
+
+    ``tile_size`` 为源瓦片边长（256 或 512）。地理索引不变时，512 源的
+    全局像素坐标恰好是 256 源的 2 倍，因此网格定位/warp 共用同一套公式。
     """
     n = 2.0**z
-    px = (lon + 180.0) / 360.0 * n * TILE_SIZE
+    px = (lon + 180.0) / 360.0 * n * tile_size
     lat_rad = lat * pi / 180.0
     t = log(tan(lat_rad) + 1 / cos(lat_rad))
-    py = (1 - t / pi) * n / 2 * TILE_SIZE
+    py = (1 - t / pi) * n / 2 * tile_size
     return px, py
 
 
